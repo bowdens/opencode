@@ -61,7 +61,15 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     abort: options.abortSignal!,
     messageID: input.processor.message.id,
     callID: options.toolCallId,
-    extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps: input.promptOps },
+    extra: {
+      model: input.model,
+      bypassAgentCheck: input.bypassAgentCheck,
+      promptOps: input.promptOps,
+      worktree:
+        process.env.OPENCODE_WORKTREE_DISABLED_SESSION === input.session.id
+          ? undefined
+          : input.session.metadata?.["opencode.worktree"],
+    },
     agent: input.agent.name,
     messages: input.messages,
     metadata: (val) =>
