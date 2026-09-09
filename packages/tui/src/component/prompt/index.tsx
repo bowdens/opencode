@@ -997,7 +997,11 @@ export function Prompt(props: PromptProps) {
       if (move.pending() && !directory) return false
       finishMoveProgress = Boolean(move.progress())
 
+      const reserved = args.session
       const res = await sdk.client.session.create({
+        id: reserved?.id,
+        title: reserved?.title ?? args.name,
+        metadata: reserved?.metadata,
         directory,
         workspace: workspaceID,
         agent: agent.name,
@@ -1020,6 +1024,7 @@ export function Prompt(props: PromptProps) {
         return true
       }
 
+      args.session = undefined
       sessionID = res.data.id
     }
 

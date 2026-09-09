@@ -471,6 +471,8 @@ describe("tool.task", () => {
     Effect.gen(function* () {
       const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
+      const binding = { directory: "/tmp/worktree", protectedDirectories: ["/tmp/project"] }
+      yield* sessions.setMetadata({ sessionID: chat.id, metadata: { "opencode.worktree": binding } })
       const tool = yield* TaskTool
       const def = yield* tool.init()
       let seen: SessionPrompt.PromptInput | undefined
@@ -498,6 +500,7 @@ describe("tool.task", () => {
       const kids = yield* sessions.children(chat.id)
       expect(kids).toHaveLength(1)
       expect(kids[0]?.id).toBe(result.metadata.sessionId)
+      expect(kids[0]?.metadata?.["opencode.worktree"]).toEqual(binding)
       expect(result.metadata.sessionId).not.toBe("ses_missing")
       expect(result.output).toContain(`<task id="${result.metadata.sessionId}" state="completed">`)
       expect(seen?.sessionID).toBe(result.metadata.sessionId)

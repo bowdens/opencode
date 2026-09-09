@@ -72,6 +72,22 @@ describe("tui thread", () => {
     expect(args.mdns).toBe(false)
   })
 
+  test("parses worktree names independently from the project positional", async () => {
+    const named = await yargs([])
+      .command({ ...TuiThreadCommand, handler: () => {} })
+      .exitProcess(false)
+      .parse(["-w", "feature-auth", "."])
+    expect(named.worktree).toBe("feature-auth")
+    expect(named.project).toBe(".")
+
+    const generated = await yargs([])
+      .command({ ...TuiThreadCommand, handler: () => {} })
+      .exitProcess(false)
+      .parse(["-w", "--prompt", "hello"])
+    expect(generated.worktree).toBe("")
+    expect(generated.prompt).toBe("hello")
+  })
+
   cliIt.live("rejects mini-only options without --mini", ({ opencode }) =>
     Effect.gen(function* () {
       const result = yield* opencode.spawn(["--replay-limit", "10"])

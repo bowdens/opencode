@@ -45,7 +45,7 @@ interface EffectCmdOpts<Args, A> {
    */
   instance?: boolean | ((args: Args) => boolean)
   /** Defaults to process.cwd(). Override for commands that take a directory positional. */
-  directory?: (args: Args) => string
+  directory?: (args: Args) => string | Promise<string>
   handler: (args: WithDoubleDash<Args>) => Effect.Effect<A, CliError, AppServices | InstanceStore.Service>
 }
 
@@ -83,7 +83,7 @@ export const effectCmd = <Args, A>(opts: EffectCmdOpts<Args, A>) =>
       }
       const { InstanceStore } = await import("@/project/instance-store")
       const { InstanceRef } = await import("@/effect/instance-ref")
-      const directory = opts.directory?.(args) ?? process.cwd()
+      const directory = (await opts.directory?.(args)) ?? process.cwd()
       const { store, ctx } = await AppRuntime.runPromise(
         InstanceStore.Service.use((store) => store.load({ directory }).pipe(Effect.map((ctx) => ({ store, ctx })))),
       )
