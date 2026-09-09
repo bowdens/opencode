@@ -853,7 +853,7 @@ function ownerRoot(directory: string) {
 }
 
 async function registerOwner(binding: Binding) {
-  const release = await acquireOperationLock(binding.directory)
+  const release = await acquireOperationLock(binding.directory, 5000)
   if (!release) throw new Error("Worktree lifecycle is busy in another process")
   const file = path.join(
     ownerRoot(binding.directory),
@@ -887,22 +887,27 @@ async function hasActiveOwner(binding: Binding, current: string) {
   return false
 }
 
-async function acquireOperationLock(directory: string): Promise<(() => Promise<void>) | undefined> {
+async function acquireOperationLock(directory: string, timeout = 0): Promise<(() => Promise<void>) | undefined> {
   const fs = await import("node:fs/promises")
   const file = operationLock(directory)
+  const deadline = Date.now() + timeout
   await fs.mkdir(path.dirname(file), { recursive: true })
-  for (const attempt of [0, 1]) {
+  while (true) {
     try {
       await fs.mkdir(file)
       await Bun.write(path.join(file, "owner.json"), JSON.stringify({ pid: process.pid }))
       return () => fs.rm(file, { recursive: true, force: true })
     } catch {
-      if (attempt > 0) return undefined
       try {
         const owner = (await Bun.file(path.join(file, "owner.json")).json()) as { pid?: unknown }
         if (typeof owner.pid === "number") process.kill(owner.pid, 0)
-        return undefined
+        if (Date.now() >= deadline) return undefined
+        await Bun.sleep(10)
       } catch {
+        if (Date.now() < deadline) {
+          await Bun.sleep(10)
+          continue
+        }
         await fs.rm(file, { recursive: true, force: true })
       }
     }
