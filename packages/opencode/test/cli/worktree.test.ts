@@ -1,9 +1,11 @@
 import { $ } from "bun"
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import path from "node:path"
 import { cliIt, testModelID } from "../lib/cli-process"
 import { reply } from "../lib/llm-server"
+import { tmpdir } from "../fixture/fixture"
+import { adoptSessionBinding, type Binding } from "@/cli/worktree"
 
 async function git(directory: string, ...args: string[]) {
   await $`git ${args}`.cwd(directory).quiet()
@@ -19,6 +21,27 @@ async function initialise(directory: string) {
 }
 
 describe("worktree CLI", () => {
+  test("serializes concurrent server ownership registration", async () => {
+    await using directory = await tmpdir()
+    await using protectedDirectory = await tmpdir()
+    const binding: Binding = {
+      version: 1,
+      sessionID: "ses_concurrent-adoption",
+      name: "concurrent-adoption",
+      directory: directory.path,
+      launchDirectory: protectedDirectory.path,
+      projectRoot: protectedDirectory.path,
+      protectedDirectories: [protectedDirectory.path],
+      base: "hook",
+      provenance: "hook",
+      timeCreated: Date.now(),
+    }
+
+    const results = await Promise.all(Array.from({ length: 4 }, () => adoptSessionBinding(binding)))
+    expect(results.every((result) => result.status === "valid")).toBe(true)
+    await Promise.all(results.flatMap((result) => (result.status === "valid" ? [result.release()] : [])))
+  })
+
   cliIt.live(
     "creates and retains a named Git worktree before a non-interactive prompt",
     ({ home, llm, opencode }) =>
