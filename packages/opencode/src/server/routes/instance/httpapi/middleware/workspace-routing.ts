@@ -219,9 +219,10 @@ function routeHttpApiWorkspace<E>(
 > {
   return Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
+    const sessionSvc = yield* Session.Service
     const sessionID = getWorkspaceRouteSessionID(requestURL(request))
     const session = sessionID
-      ? yield* Session.Service.use((svc) => svc.get(sessionID)).pipe(
+      ? yield* sessionSvc.get(sessionID).pipe(
           Effect.catchIf(
             (error): error is NotFoundError => NotFoundError.isInstance(error),
             () => Effect.succeed(undefined),
@@ -229,8 +230,28 @@ function routeHttpApiWorkspace<E>(
           Effect.catchDefect(() => Effect.succeed(undefined)),
         )
       : undefined
-    const plan = yield* planRequest(request, session)
-    return yield* routeWorkspace(client, effect, plan)
+    const adoption = session
+      ? yield* Effect.gen(function* () {
+          const binding = session.metadata?.["opencode.worktree"]
+          if (!binding) return { session }
+          const { adoptSessionBinding } = yield* Effect.promise(() => import("@/cli/worktree"))
+          const result = yield* Effect.promise(() => adoptSessionBinding(binding))
+          if (result.status === "valid") return { session, release: result.release }
+          yield* Effect.logWarning("worktree session could not be adopted", { sessionID, status: result.status })
+          const metadata = { ...session.metadata }
+          delete metadata["opencode.worktree"]
+          const fallback = result.binding?.launchDirectory ?? defaultDirectory(request, requestURL(request))
+          if (result.status === "gone" || result.status === "unsafe") {
+            yield* sessionSvc.clearWorktree({ sessionID: session.id, directory: fallback })
+          }
+          return { session: { ...session, directory: fallback, metadata } }
+        })
+      : { session: undefined, release: undefined }
+    const plan = yield* planRequest(request, adoption.session)
+    const routed = routeWorkspace(client, effect, plan)
+    return yield* adoption.release
+      ? routed.pipe(Effect.ensuring(Effect.promise(adoption.release).pipe(Effect.ignore)))
+      : routed
   })
 }
 

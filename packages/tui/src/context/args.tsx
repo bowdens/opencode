@@ -8,6 +8,12 @@ export interface Args {
   sessionID?: string
   fork?: boolean
   auto?: boolean
+  name?: string
+  session?: {
+    id: string
+    title?: string
+    metadata: Record<string, unknown>
+  }
 }
 
 export const { use: useArgs, provider: ArgsProvider } = createSimpleContext({

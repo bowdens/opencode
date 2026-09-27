@@ -21,6 +21,11 @@ import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
+import {
+  active as worktreeIsolationActive,
+  assertCommand as assertWorktreeCommand,
+  assertPaths as assertWorktreePaths,
+} from "./worktree-isolation"
 
 export { Parameters } from "./shell/prompt"
 
@@ -64,6 +69,109 @@ const CMD_FILES = new Set([
 ])
 const FLAGS = new Set(["-destination", "-literalpath", "-path"])
 const SWITCHES = new Set(["-confirm", "-debug", "-force", "-nonewline", "-recurse", "-verbose", "-whatif"])
+const DYNAMIC_EXECUTABLES = new Set([
+  "bash",
+  "bun",
+  "bunx",
+  "cmd",
+  "deno",
+  "eval",
+  "node",
+  "npx",
+  "perl",
+  "php",
+  "powershell",
+  "pwsh",
+  "python",
+  "python3",
+  "ruby",
+  "sh",
+  "source",
+  "xargs",
+  "zsh",
+])
+const SAFE_WORKTREE_EXECUTABLES = new Set([
+  "[",
+  "cat",
+  "cd",
+  "chdir",
+  "chmod",
+  "chown",
+  "cp",
+  "cut",
+  "diff",
+  "dir",
+  "echo",
+  "false",
+  "git",
+  "grep",
+  "ls",
+  "mkdir",
+  "mv",
+  "popd",
+  "printf",
+  "pushd",
+  "pwd",
+  "rm",
+  "rmdir",
+  "set-location",
+  "sort",
+  "test",
+  "touch",
+  "tr",
+  "true",
+  "type",
+  "uniq",
+  "wc",
+  "which",
+])
+const GIT_BUILTINS = new Set([
+  "add",
+  "annotate",
+  "apply",
+  "bisect",
+  "blame",
+  "branch",
+  "checkout",
+  "cherry",
+  "cherry-pick",
+  "clean",
+  "clone",
+  "commit",
+  "config",
+  "describe",
+  "diff",
+  "diff-tree",
+  "fetch",
+  "for-each-ref",
+  "format-patch",
+  "grep",
+  "init",
+  "log",
+  "ls-files",
+  "ls-tree",
+  "merge",
+  "merge-base",
+  "mv",
+  "pull",
+  "push",
+  "rebase",
+  "reflog",
+  "remote",
+  "reset",
+  "restore",
+  "rev-list",
+  "rev-parse",
+  "rm",
+  "show",
+  "show-ref",
+  "stash",
+  "status",
+  "switch",
+  "symbolic-ref",
+  "tag",
+  "worktree",
+])
 
 type Part = {
   type: string
@@ -72,8 +180,11 @@ type Part = {
 
 type Scan = {
   dirs: Set<string>
+  paths: Set<string>
   patterns: Set<string>
   always: Set<string>
+  unsafeGitRedirect: boolean
+  ambiguous: boolean
 }
 
 type Chunk = {
@@ -183,6 +294,29 @@ function prefix(text: string) {
   if (!match) return text
   if (match.index === 0) return
   return text.slice(0, match.index)
+}
+
+function likelyPath(text: string) {
+  const value = unquote(text)
+  return (
+    value.startsWith(".") ||
+    value.startsWith("~") ||
+    value.startsWith("/") ||
+    value.startsWith("\\") ||
+    /^[A-Za-z]:[\\/]/.test(value) ||
+    value.includes("/") ||
+    value.includes("\\")
+  )
+}
+
+function obfuscatedPath(text: string, type?: string) {
+  const value = unquote(text)
+  return (
+    type === "concatenation" ||
+    value.includes('"') ||
+    value.includes("'") ||
+    (process.platform !== "win32" && value.includes("\\"))
+  )
 }
 
 function pathArgs(list: Part[], ps: boolean, cmd = false) {
@@ -384,8 +518,11 @@ export const ShellTool = Tool.define(
     ) {
       const scan: Scan = {
         dirs: new Set<string>(),
+        paths: new Set<string>(),
         patterns: new Set<string>(),
         always: new Set<string>(),
+        unsafeGitRedirect: false,
+        ambiguous: false,
       }
       const shellKind = ShellID.toKind(Shell.name(shell))
 
@@ -393,11 +530,90 @@ export const ShellTool = Tool.define(
         const command = parts(node)
         const tokens = command.map((item) => item.text)
         const cmd = ps || shellKind === "cmd" ? tokens[0]?.toLowerCase() : tokens[0]
+        const executable = cmd
+          ? path
+              .basename(unquote(cmd))
+              .toLowerCase()
+              .replace(/\.exe$/, "")
+          : undefined
+        if (executable && DYNAMIC_EXECUTABLES.has(executable)) scan.ambiguous = true
+        if (executable && !SAFE_WORKTREE_EXECUTABLES.has(executable)) scan.ambiguous = true
+        if (
+          command.slice(1).some((item) =>
+            DYNAMIC_EXECUTABLES.has(
+              path
+                .basename(unquote(item.text))
+                .toLowerCase()
+                .replace(/\.exe$/, ""),
+            ),
+          )
+        )
+          scan.ambiguous = true
+        if (node.text.includes("$(") || node.text.includes("`")) scan.ambiguous = true
+
+        for (const item of command.slice(1).filter((item) => likelyPath(item.text))) {
+          if (obfuscatedPath(item.text, item.type)) scan.ambiguous = true
+          const resolved = yield* argPath(item.text, cwd, ps, shell)
+          if (resolved) scan.paths.add(resolved)
+          else scan.ambiguous = true
+        }
+
+        for (const match of source(node).matchAll(/(?:^|\s)(?:>|>>|<)\s*([^\s;&|]+)/g)) {
+          if (obfuscatedPath(match[1])) scan.ambiguous = true
+          const resolved = yield* argPath(match[1], cwd, ps, shell)
+          if (resolved) scan.paths.add(resolved)
+          else scan.ambiguous = true
+        }
+
+        const gitIndex = command.findIndex(
+          (item) =>
+            path
+              .basename(unquote(item.text))
+              .toLowerCase()
+              .replace(/\.exe$/, "") === "git",
+        )
+        if (gitIndex >= 0) {
+          let subcommand: string | undefined
+          for (let index = gitIndex + 1; index < command.length; index++) {
+            const token = command[index]?.text ?? ""
+            const previous = command[index - 1]?.text
+            if (
+              ["-c", "--config-env", "--exec-path"].includes(token) ||
+              token.startsWith("--config-env=") ||
+              token.startsWith("--exec-path=")
+            ) {
+              scan.ambiguous = true
+            }
+            const inline = token.match(/^(?:-C|--git-dir|--work-tree)=(.+)$/)
+            if (!inline && previous !== "-C" && previous !== "--git-dir" && previous !== "--work-tree") continue
+            const value = inline?.[1] ?? token
+            const resolved = yield* argPath(value, cwd, ps, shell)
+            if (!resolved) {
+              scan.unsafeGitRedirect = true
+              continue
+            }
+            scan.paths.add(resolved)
+          }
+          const takesValue = new Set(["-C", "-c", "--config-env", "--git-dir", "--work-tree"])
+          for (let index = gitIndex + 1; index < command.length; index++) {
+            const token = unquote(command[index]?.text ?? "")
+            if (takesValue.has(token)) {
+              index++
+              continue
+            }
+            if (token.startsWith("-")) continue
+            subcommand = token.toLowerCase()
+            break
+          }
+          if (subcommand && !GIT_BUILTINS.has(subcommand)) scan.ambiguous = true
+        }
+        if (/\bGIT_[A-Z0-9_]+\s*=/i.test(source(node))) scan.unsafeGitRedirect = true
 
         if (cmd && (FILES.has(cmd) || (shellKind === "cmd" && CMD_FILES.has(cmd)))) {
           for (const arg of pathArgs(command, ps, shellKind === "cmd")) {
             const resolved = yield* argPath(arg, cwd, ps, shell)
             yield* Effect.logInfo("resolved path", { arg, resolved })
+            if (resolved) scan.paths.add(resolved)
             if (!resolved || containsPath(resolved, instance)) continue
             const dir = (yield* fs.isDir(resolved)) ? resolved : path.dirname(resolved)
             scan.dirs.add(dir)
@@ -623,6 +839,11 @@ export const ShellTool = Tool.define(
                     Effect.sync(() => tree.delete()),
                   )
                   const scan = yield* collect(tree.rootNode, cwd, ps, shell, instanceCtx)
+                  yield* assertWorktreeCommand(ctx, params.command)
+                  if (worktreeIsolationActive(ctx) && (scan.unsafeGitRedirect || scan.ambiguous)) {
+                    throw new Error("Worktree isolation could not safely determine the shell command's path targets")
+                  }
+                  yield* assertWorktreePaths(ctx, [cwd, ...scan.paths])
                   if (!containsPath(cwd, instanceCtx)) scan.dirs.add(cwd)
                   yield* ask(ctx, scan, params)
                 }),

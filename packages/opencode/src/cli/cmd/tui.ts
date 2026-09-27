@@ -101,6 +101,25 @@ export const TuiThreadCommand = cmd({
         type: "string",
         describe: "prompt to use",
       })
+      .option("worktree", {
+        alias: ["w"],
+        type: "string",
+        requiresArg: false,
+        describe: "start the session in a new or existing worktree",
+      })
+      .option("name", {
+        alias: ["n"],
+        type: "string",
+        describe: "name for the session",
+      })
+      .option("settings", {
+        type: "string",
+        describe: "Claude settings JSON or path used for worktree hooks",
+      })
+      .option("tmux", {
+        type: "boolean",
+        hidden: true,
+      })
       .option("agent", {
         type: "string",
         describe: "agent to use",
@@ -142,6 +161,11 @@ export const TuiThreadCommand = cmd({
         hidden: true,
       }),
   handler: async (args) => {
+    if (args.tmux) {
+      UI.error("--tmux worktree sessions are not supported")
+      process.exitCode = 1
+      return
+    }
     if (args.replay === true) {
       UI.error("--replay is not supported; replay is enabled by default")
       process.exitCode = 1
@@ -168,6 +192,9 @@ export const TuiThreadCommand = cmd({
         model: args.model,
         agent: args.agent,
         prompt: args.prompt,
+        worktree: args.worktree,
+        name: args.name,
+        settings: args.settings,
         replay: noReplay ? false : undefined,
         replayLimit: args.replayLimit,
         demo: args.demo,
@@ -197,7 +224,9 @@ export const TuiThreadCommand = cmd({
 
       // Resolve relative --project paths from PWD, then use the real cwd after
       // chdir so the thread and worker share the same directory key.
-      const next = resolveThreadDirectory(args.project)
+      const launch = resolveThreadDirectory(args.project)
+      const { resolveDirectory, sessionInput, finish: finishWorktree } = await import("@/cli/worktree")
+      const next = await resolveDirectory(args, launch, { interactive: true })
       const file = await target()
       try {
         process.chdir(next)
@@ -292,9 +321,14 @@ export const TuiThreadCommand = cmd({
               prompt,
               fork: args.fork,
               auto: args.auto || args.yolo || args["dangerously-skip-permissions"],
+              name: args.name,
+              session: sessionInput(args),
             },
           }),
         )
+        process.chdir(launch)
+        await stop()
+        await finishWorktree(args, true, Boolean(args.name))
       } finally {
         await stop()
       }
