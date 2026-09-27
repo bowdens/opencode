@@ -83,7 +83,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     const get = Effect.fn("SessionHttpApi.get")(function* (ctx: { params: { sessionID: SessionID } }) {
-      return yield* requireSession(ctx.params.sessionID)
+      const info = yield* requireSession(ctx.params.sessionID)
+      const directory = yield* InstanceState.directory
+      return directory === info.directory || !info.metadata?.["opencode.worktree"] ? info : { ...info, directory }
     })
 
     const children = Effect.fn("SessionHttpApi.children")(function* (ctx: { params: { sessionID: SessionID } }) {
@@ -185,8 +187,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof UpdatePayload.Type
     }) {
       const current = yield* requireSession(ctx.params.sessionID)
-      if (ctx.payload.title !== undefined) {
-        yield* session.setTitle({ sessionID: ctx.params.sessionID, title: ctx.payload.title })
+      const title = ctx.payload.title
+      if (title !== undefined) {
+        yield* session.setTitle({ sessionID: ctx.params.sessionID, title })
+        if (current.metadata?.["opencode.worktree"]) {
+          const { markSessionName } = yield* Effect.promise(() => import("@/cli/worktree"))
+          yield* Effect.promise(() => markSessionName(ctx.params.sessionID, title))
+        }
       }
       if (ctx.payload.metadata !== undefined) {
         yield* session.setMetadata({ sessionID: ctx.params.sessionID, metadata: ctx.payload.metadata })

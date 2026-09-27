@@ -142,7 +142,15 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
       get client() {
         return sdk
       },
-      directory: props.directory,
+      get directory() {
+        return props.directory
+      },
+      setDirectory(directory: string) {
+        if (props.directory === directory) return
+        props.directory = directory
+        sdk = createSDK()
+        if (!props.events) startSSE()
+      },
       event: emitter,
       fetch: props.fetch ?? fetch,
       url: props.url,

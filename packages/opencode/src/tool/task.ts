@@ -159,6 +159,9 @@ export const TaskTool = Tool.define(
           parentID: ctx.sessionID,
           title: params.description + ` (@${next.name} subagent)`,
           agent: next.name,
+          metadata: parent.metadata?.["opencode.worktree"]
+            ? { "opencode.worktree": parent.metadata["opencode.worktree"] }
+            : undefined,
           permission: [
             ...childPermission,
             ...childToolDenies.filter(

@@ -19,7 +19,7 @@ import { pathToFileURL } from "url"
 import { open } from "node:fs/promises"
 import { Effect } from "effect"
 import { UI } from "../ui"
-import { effectCmd } from "../effect-cmd"
+import { effectCmd, fail } from "../effect-cmd"
 import { EOL } from "os"
 import { Filesystem } from "@/util/filesystem"
 import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
@@ -131,7 +131,11 @@ export const RunCommand = effectCmd({
   instance: (args) => !args.attach,
   // For --dir without --attach, load instance for the resolved target dir.
   // The handler also chdirs (preserving the legacy order: chdir → file resolution).
-  directory: (args) => (args.dir && !args.attach ? path.resolve(process.cwd(), args.dir) : process.cwd()),
+  directory: async (args) => {
+    const launch = args.dir && !args.attach ? path.resolve(process.cwd(), args.dir) : process.cwd()
+    const { resolveDirectory } = await import("@/cli/worktree")
+    return resolveDirectory(args, launch, { interactive: Boolean(args.mini) })
+  },
   builder: (yargs: Argv) =>
     yargs
       .positional("message", {
@@ -143,6 +147,29 @@ export const RunCommand = effectCmd({
       .option("command", {
         describe: "the command to run, use message for args",
         type: "string",
+      })
+      .option("prompt", {
+        describe: "message to send when using an option with an optional value",
+        type: "string",
+      })
+      .option("worktree", {
+        alias: ["w"],
+        describe: "start the session in a new or existing worktree",
+        type: "string",
+        requiresArg: false,
+      })
+      .option("name", {
+        alias: ["n"],
+        describe: "name for the session",
+        type: "string",
+      })
+      .option("settings", {
+        describe: "Claude settings JSON or path used for worktree hooks",
+        type: "string",
+      })
+      .option("tmux", {
+        type: "boolean",
+        hidden: true,
       })
       .option("continue", {
         alias: ["c"],
@@ -261,6 +288,8 @@ export const RunCommand = effectCmd({
         describe: "enable direct interactive demo slash commands; pass one as the message to run it immediately",
       }),
   handler: Effect.fn("Cli.run")(function* (args) {
+    if (args.attach && args.worktree !== undefined) return yield* fail("--worktree cannot be used with --attach")
+    if (args.tmux) return yield* fail("--tmux worktree sessions are not supported")
     const { Agent } = yield* Effect.promise(() => import("@/agent/agent"))
     const { RuntimeFlags } = yield* Effect.promise(() => import("@/effect/runtime-flags"))
     const { InstanceRef } = yield* Effect.promise(() => import("@/effect/instance-ref"))
@@ -269,7 +298,6 @@ export const RunCommand = effectCmd({
     const flags = yield* RuntimeFlags.Service
     const localInstance = yield* InstanceRef
     yield* Effect.promise(async () => {
-      const rawMessage = [...args.message, ...(args["--"] || [])].join(" ")
       const interactive = args.mini
       const auto = args.auto || args.yolo || args["dangerously-skip-permissions"]
       const thinking = interactive ? (args.thinking ?? true) : (args.thinking ?? false)
@@ -284,10 +312,16 @@ export const RunCommand = effectCmd({
 
         throw error
       }
+      if (args.prompt !== undefined && (args.message.length > 0 || (args["--"]?.length ?? 0) > 0)) {
+        die("--prompt cannot be combined with a positional message")
+      }
+      const rawMessage = args.prompt ?? [...args.message, ...(args["--"] || [])].join(" ")
 
-      let message = [...args.message, ...(args["--"] || [])]
-        .map((arg) => (arg.includes(" ") ? `"${arg.replace(/"/g, '\\"')}"` : arg))
-        .join(" ")
+      let message =
+        args.prompt ??
+        [...args.message, ...(args["--"] || [])]
+          .map((arg) => (arg.includes(" ") ? `"${arg.replace(/"/g, '\\"')}"` : arg))
+          .join(" ")
 
       if (interactive && args.command) {
         die("--mini cannot be used with --command")
@@ -330,9 +364,15 @@ export const RunCommand = effectCmd({
 
       const replay = args.replay === false ? false : args.replay || args["replay-limit"] !== undefined
 
+      const { sessionInput, state: worktreeState } = await import("@/cli/worktree")
+      const prepared = worktreeState(args)
       const root = Filesystem.resolve(process.env.PWD ?? process.cwd())
       const directory = (() => {
-        if (!args.dir) return args.attach ? undefined : root
+        if (prepared) {
+          process.chdir(prepared.binding.directory)
+          return prepared.binding.directory
+        }
+        if (!args.dir) return args.attach ? undefined : (localInstance?.directory ?? root)
         if (args.attach) return args.dir
 
         try {
@@ -448,6 +488,7 @@ export const RunCommand = effectCmd({
           ]
 
       function title() {
+        if (args.name !== undefined) return args.name
         if (args.title === undefined) return
         if (args.title !== "") return args.title
         return message.slice(0, 50) + (message.length > 50 ? "..." : "")
@@ -516,8 +557,11 @@ export const RunCommand = effectCmd({
         }
 
         const name = title()
+        const worktree = sessionInput(args)
         const result = await sdk.session.create({
-          title: name,
+          id: worktree?.id,
+          title: worktree?.title ?? name,
+          metadata: worktree?.metadata,
           permission: [...rules],
         })
         const id = result.data?.id
@@ -551,8 +595,12 @@ export const RunCommand = effectCmd({
         sdk: OpencodeClient,
         input: { agent: string | undefined; model: ModelInput | undefined; variant: string | undefined },
       ): Promise<SessionInfo> {
+        const worktree = sessionInput(args)
         const result = await sdk.session.create({
-          title: args.title !== undefined && args.title !== "" ? args.title : undefined,
+          id: worktree?.id,
+          title:
+            worktree?.title ?? args.name ?? (args.title !== undefined && args.title !== "" ? args.title : undefined),
+          metadata: worktree?.metadata,
           agent: input.agent,
           model: input.model
             ? {
@@ -960,6 +1008,8 @@ export const RunCommand = effectCmd({
       })
       await execute(sdk)
     })
+    const { finish: finishWorktree } = yield* Effect.promise(() => import("@/cli/worktree"))
+    yield* Effect.promise(() => finishWorktree(args, Boolean(args.mini), Boolean(args.name ?? args.title)))
   }),
 })
 
@@ -974,6 +1024,9 @@ type MiniCommandInput = {
   model?: string
   agent?: string
   prompt?: string
+  worktree?: string
+  name?: string
+  settings?: string
   replay?: boolean
   replayLimit?: number
   demo?: boolean
@@ -985,6 +1038,11 @@ export async function runMini(input: MiniCommandInput) {
     $0: "opencode",
     _: ["mini"],
     message: input.prompt ? [input.prompt] : [],
+    prompt: undefined,
+    worktree: input.worktree,
+    name: input.name,
+    settings: input.settings,
+    tmux: undefined,
     command: undefined,
     continue: input.continue,
     session: input.session,

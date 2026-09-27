@@ -280,7 +280,9 @@ export function DialogSessionList() {
       onMove={() => {
         setToDelete(undefined)
       }}
-      onSelect={(option) => {
+      onSelect={async (option) => {
+        const result = await sdk.client.session.get({ sessionID: option.value })
+        if (result.data?.directory) sdk.setDirectory(result.data.directory)
         route.navigate({
           type: "session",
           sessionID: option.value,
