@@ -1,0 +1,3327 @@
+diff --git a/WORKTREE_FLAG_SPEC.md b/WORKTREE_FLAG_SPEC.md
+new file mode 100644
+index 0000000000..13dcbb338c
+--- /dev/null
++++ b/WORKTREE_FLAG_SPEC.md
+@@ -0,0 +1,694 @@
++# Specification: Claude-compatible `--worktree` / `-w`
++
++**Status:** draft, uncommitted
++**Research baseline:** Claude Code 2.1.266, macOS, September 2026
++**Scope:** observable behaviour required for OpenCode's local CLI to provide the core Claude Code `--worktree` workflow, including command-form setup and cleanup hooks used by repositories.
++
++This document specifies behaviour, not module ownership or implementation structure. `MUST`, `MUST NOT`, `SHOULD` and `MAY` are used in the RFC 2119 sense.
++
++---
++
++## 1. Purpose
++
++`claude --worktree` creates an isolated checkout, starts a session inside it, records that checkout as the session's current worktree, and decides what to retain when the session ends. Reproducing only the initial `git worktree add` command is insufficient. A compatible harness must also preserve:
++
++1. CLI parsing and generated names.
++2. Base revision selection.
++3. Repository setup through `.worktreeinclude` or lifecycle hooks.
++4. Isolation from the main checkout.
++5. Session resume into the same worktree.
++6. Safe cleanup of the checkout and branch.
++
++The primary motivation is to let a repository with existing Claude Code worktree setup scripts use OpenCode without maintaining a second launcher.
++
++This specification defines a **core compatibility profile** for local CLI sessions and command-form `WorktreeCreate` and `WorktreeRemove` hooks. Claude's `--tmux` integration, PR/MR shorthand, HTTP and MCP hook transports, background-agent isolation, isolated subagents, `worktree.symlinkDirectories`, `worktree.sparsePaths`, and the in-session `EnterWorktree` and `ExitWorktree` tools are adjacent features. They are documented where they affect the design but are not required for core conformance. An implementation **MUST** reject or clearly warn about an unsupported adjacent feature rather than silently ignoring it.
++
++---
++
++## 2. Evidence and confidence
++
++Claims use these labels:
++
++- **[OBSERVED]**: verified against the locally installed Claude Code 2.1.266 CLI or a controlled hook probe.
++- **[DOCUMENTED]**: stated in Anthropic's official Claude Code documentation as fetched on 9 September 2026.
++- **[ISSUE-REPORTED]**: reported or confirmed in the public `anthropics/claude-code` issue tracker, but not independently reproduced for this specification.
++- **[UNVERIFIED]**: not established by the available sources. These are implementation decisions or candidates for a dedicated probe.
++- **[OPENCODE-DESIGN]**: behaviour chosen for safety or compatibility with OpenCode where Claude's behaviour is undocumented.
++- **[OPENCODE-DIVERGENCE]**: an intentional difference from Claude Code, outside the core compatibility profile.
++
++Official current documentation is normative where it is explicit. Issue reports are used to identify edge cases, not to define intended behaviour.
++
++---
++
++## 3. Terminology
++
++| Term | Meaning |
++| --- | --- |
++| **Launch directory** | The process working directory from which the CLI is invoked. |
++| **Project root** | The Git working-tree root containing the launch directory, or the launch directory for a non-Git custom-hook launch. |
++| **Main checkout** | The protected source checkout from which the isolated session is launched. This may itself be a linked worktree or, for custom creation, a non-Git source tree. |
++| **Session worktree** | The isolated checkout adopted by the new session. |
++| **Worktree name** | The optional value consumed by `-w` / `--worktree`. It is not the session display name. |
++| **Session name** | The independent display/resume name supplied by `--name` or an in-session rename. |
++| **Fresh base** | The repository's remote default branch, with documented fallbacks. |
++| **Head base** | The current local `HEAD` of the checkout from which creation is requested. |
++| **Default creation** | Claude-compatible Git worktree creation when no `WorktreeCreate` hook replaces it. |
++| **Custom creation** | Creation delegated to a configured `WorktreeCreate` hook. |
++
++---
++
++## 4. CLI contract
++
++### 4.1 Flag shape
++
++The CLI **MUST** accept both forms:
++
++```text
++-w [name]
++--worktree [name]
++```
++
++The value is optional. **[OBSERVED]** Local `claude --help` reports `-w, --worktree [name]`.
++
++When a name is supplied, it identifies the worktree request. When omitted, the harness **MUST** generate a human-readable name, such as `vectorized-seeking-pumpkin`. **[OBSERVED]**
++
++The worktree name and session name **MUST** remain separate. Supplying `-w auth` does not imply `--name auth`. **[DOCUMENTED]**
++
++### 4.2 Optional-value parsing
++
++The optional argument consumes the next ordinary positional value:
++
++```bash
++claude -w ONLY_ARGUMENT
++```
++
++`ONLY_ARGUMENT` is the worktree name, not an initial prompt. **[OBSERVED]**
++
++The option terminator leaves the worktree unnamed and preserves the following positional as the prompt:
++
++```bash
++claude -w -- "PROMPT"
++```
++
++This generated a worktree name in a controlled `WorktreeCreate` hook probe. **[OBSERVED]**
++
++OpenCode already uses its default positional as a project path and exposes `--prompt` for an initial prompt. The implementation **MUST NOT** break `opencode <project>`. It **SHOULD** provide these unambiguous forms:
++
++```bash
++opencode -w feature-auth --prompt "implement authentication"
++opencode -w --prompt "implement authentication"
++```
++
++Exact support for Claude's trailing positional prompt syntax is outside the core profile because it conflicts with OpenCode's existing project positional. **[OPENCODE-DIVERGENCE]** The explicit `--prompt` form is normative for OpenCode (§18.1).
++
++### 4.3 Related flags
++
++- `--tmux` requires `--worktree` in Claude Code and starts the worktree session in a tmux session. **[DOCUMENTED]** It is outside the core profile. **[OPENCODE-DIVERGENCE]**
++- Model, agent, permission and initial-prompt options **MUST** apply to the session after it enters the worktree.
++- A worktree request in non-interactive mode **MUST** complete creation before model execution begins.
++- Unknown or invalid worktree combinations **MUST** fail before starting a session rather than silently running in the main checkout.
++- OpenCode **MUST** support `--name` or an equivalent explicit session-name option because cleanup distinguishes explicitly named sessions from unnamed sessions.
++- The interactive TUI and non-interactive `opencode run` entry points **MUST** support worktree mode. Both complete setup before model execution; `opencode run` follows the non-interactive cleanup semantics in §13.3.
++
++---
++
++## 5. Preconditions and project identity
++
++### 5.1 Git repositories
++
++Default creation requires:
++
++1. A Git repository containing the launch directory.
++2. At least one commit that can resolve as a base.
++3. A project root and Git common directory that can be resolved safely.
++
++In a repository with no commits, creation **MUST** fail before session startup. Claude Code reports that it failed to resolve `HEAD`. **[DOCUMENTED]**
++
++### 5.2 Non-Git repositories
++
++Without Git, `-w` **MUST** fail unless a `WorktreeCreate` hook supplies the checkout. A custom hook replaces the Git mechanism and may implement SVN, Perforce, Mercurial or another isolation scheme. **[DOCUMENTED]**
++
++### 5.3 Workspace trust
++
++An interactive request **MUST NOT** execute project-controlled setup hooks before the launch project is trusted. Claude Code requires the user to trust the project before an interactive `--worktree` launch and tells the user to run Claude normally once when trust is absent. Non-interactive Claude runs skip this trust dialog. **[DOCUMENTED]**
++
++OpenCode **MUST** apply its own equivalent trust and permission model before running repository-controlled commands. It **MUST NOT** silently treat `-w` as permission to run arbitrary project setup.
++
++### 5.4 Launching from a linked worktree
++
++When launched from inside an existing linked worktree, `head` means that checkout's `HEAD`. The protected main checkout for isolation includes both the launch checkout and the canonical checkout linked through Git metadata. **[DOCUMENTED]**
++
++The exact default destination root when launching from a linked worktree has changed in Claude Code and remains poorly documented. **[ISSUE-REPORTED]** OpenCode **SHOULD** anchor the managed destination under the Git working-tree root that contains the launch directory, not unexpectedly jump to another checkout (§18.2).
++
++---
++
++## 6. Names, paths and branches
++
++### 6.1 Default destination
++
++For default creation, the session worktree **MUST** be placed under:
++
++```text
++<project-root>/.claude/worktrees/<name>/
++```
++
++This is both the documented location and the location expected by Claude Code tooling. **[DOCUMENTED]**
++
++Repositories **SHOULD** ignore `.claude/worktrees/` so managed checkouts do not appear as untracked content in the main checkout.
++
++### 6.2 Default branch
++
++For an ordinary named request, default creation **MUST** create a branch named:
++
++```text
++worktree-<name>
++```
++
++**[DOCUMENTED]**
++
++Worktree directory names and Git branch names have different validity rules. Historical Claude versions replaced `/` with `+` in both, and issue reports dispute whether `/` should remain in the branch. **[ISSUE-REPORTED]** Exact normalization for names containing separators, control characters, `..`, platform-reserved names or invalid Git ref characters is delegated (§18.3). Simple names containing only ASCII letters, digits, `_` and `-` **MUST** retain the documented path and branch exactly when the name is not platform-reserved and `worktree-<name>` passes `git check-ref-format --branch`.
++
++### 6.3 Generated names
++
++When no value is supplied, the harness **MUST** generate a collision-resistant, human-readable slug and use it consistently for hook input, directory selection and branch selection. The exact word list and entropy are not part of compatibility.
++
++### 6.4 Existing names
++
++Passing a name whose managed directory already exists **MUST** reopen that worktree rather than create a second checkout. **[DOCUMENTED]**
++
++With `worktree.baseRef: "fresh"`, a clean, unchanged, Claude-created worktree may be reset to the current default branch when it has no unique work left, including after its remote branch was merged and deleted. Otherwise it **MUST** reopen at its existing tip. A `head`-based or pull-request worktree **MUST NOT** be reset by this reuse optimisation. **[DOCUMENTED]**
++
++An existing directory that is not a valid isolated checkout **MUST NOT** be silently adopted as though creation succeeded.
++
++---
++
++## 7. Base revision selection
++
++### 7.1 Configuration
++
++Claude Code accepts this setting at user, project, local and managed scopes:
++
++```json
++{
++  "worktree": {
++    "baseRef": "fresh"
++  }
++}
++```
++
++Allowed values are `fresh` and `head`; the default is `fresh`. **[DOCUMENTED]**
++
++For compatibility with Claude-configured repositories, OpenCode **MUST** recognise `worktree.baseRef` through the same effective Claude-settings resolver used for hooks. The precedence is managed settings, CLI `--settings`, project-local settings, shared-project settings, then user settings. A future native OpenCode setting may act as an alias or a lower-precedence fallback, but **MUST NOT** override a managed Claude setting. Mixed configuration **MUST** be observable.
++
++### 7.2 Fresh base
++
++`fresh` **MUST** prefer the remote default branch, normally `origin/main` or `origin/master`. **[DOCUMENTED]**
++
++Claude Code refreshes the default branch when the repository has not been fetched in the last 24 hours, caps that fetch at five seconds, and uses its locally cached ref if the fetch fails. If no usable remote default exists, it falls back to local `HEAD`. **[DOCUMENTED]**
++
++The harness **SHOULD** match those semantics. It **MUST NOT** claim to have used a fresh remote base while silently using an unrelated stale or local ref.
++
++### 7.3 Head base
++
++`head` **MUST** branch from the current local `HEAD`, including unpushed commits and feature-branch state. Inside a linked worktree, it means that worktree's `HEAD`. **[DOCUMENTED]**
++
++Uncommitted and untracked files are not part of `HEAD` and **MUST NOT** be copied by base selection. They are handled only by `.worktreeinclude`, symlink configuration or a custom hook.
++
++### 7.4 Pull and merge requests
++
++The worktree value may be:
++
++- `#<number>`
++- A GitHub pull request URL
++- A GitLab merge request URL
++
++The shell form beginning with `#` must be quoted. Claude Code fetches the change from `origin`, creates `.claude/worktrees/pr-<number>`, and branches from the fetched head. Host-specific fetch refs are documented as:
++
++| Origin host | Fetch strategy |
++| --- | --- |
++| `github.com` | `pull/<number>/head` |
++| `gitlab.com` | `merge-requests/<number>/head` |
++| Other hosts | Try GitHub form, then GitLab form |
++
++PR/MR shorthand is outside the core profile. OpenCode **MUST** either implement the documented syntax or reject it with a clear unsupported-feature error rather than misinterpret it as a literal directory name. **[OPENCODE-DIVERGENCE]**
++
++---
++
++## 8. Default creation lifecycle
++
++Given a valid request without a replacing hook, the harness **MUST** perform these stages in order:
++
++1. Resolve and validate the launch repository and project root.
++2. Resolve or generate the worktree name.
++3. Resolve the requested base revision.
++4. Determine whether a valid existing managed worktree can be reused.
++5. Create a distinct Git worktree and branch when reuse does not apply.
++6. Process configured sparse-checkout and shared-directory behaviour according to §9: apply supported features, otherwise reject or clearly warn before continuing.
++7. Copy eligible ignored files from `.worktreeinclude`.
++8. Validate that the resulting checkout is separate from every protected checkout.
++9. Bind the session to the resulting absolute path.
++10. Start the OpenCode session and deliver any initial prompt.
++
++The exact setup order above is an OpenCode design choice so that shared directories exist before ignored-file copies and every setup step completes before validation and model execution. **[OPENCODE-DESIGN]**
++
++The model **MUST NOT** run before creation, setup and validation complete.
++
++On a failure before session binding, the command **MUST** exit non-zero and **MUST NOT** fall back to the launch directory. Resources created by the failed attempt **SHOULD** be rolled back when that can be done without deleting pre-existing work. **[OPENCODE-DESIGN]** (§18.4)
++
++### 8.1 Git filters
++
++Claude Code does not execute repository-local Git filter-driver commands while creating managed worktrees because repository content can influence those commands. This means locally configured Git LFS filters may leave pointer files. It refuses creation when it cannot safely determine or neutralise repository filter drivers. **[DOCUMENTED]**
++
++OpenCode **SHOULD** preserve this security property. It **MUST NOT** execute untrusted repository-configured filters merely because `-w` was passed.
++
++### 8.2 Worktree lock and ownership marker
++
++Claude Code locks a managed worktree while its agent is running and marks Git metadata for worktrees it owns. Cleanup uses that marker to avoid deleting worktrees created manually. **[DOCUMENTED]**
++
++OpenCode **SHOULD** use equivalent ownership and liveness metadata. It **MUST NOT** remove an unmarked user-created worktree during automated retention cleanup.
++
++---
++
++## 9. Repository setup
++
++### 9.1 `.worktreeinclude`
++
++For default Git creation, the harness **MUST** look for `<project-root>/.worktreeinclude`. The file uses Git-ignore syntax. **[DOCUMENTED]**
++
++Only a source path that satisfies both conditions may be copied:
++
++1. It matches at least one `.worktreeinclude` pattern.
++2. Git considers it ignored in the source checkout.
++
++Tracked files **MUST NOT** be overlaid from the source checkout. Parent directories must be created as needed. Copies **MUST** remain inside the destination worktree after path normalization and symlink checks.
++
++`.worktreeinclude` is not processed when `WorktreeCreate` replaces default creation. The hook owns all copying in that case. **[DOCUMENTED]**
++
++### 9.2 Shared directories
++
++Claude's `worktree.symlinkDirectories` setting contains repository-root-relative directories, such as `node_modules`, to link from the main checkout into each new worktree. The default is no links. **[DOCUMENTED]**
++
++OpenCode **SHOULD** support this setting. It **MUST** reject absolute paths, traversal outside either checkout, and destinations that would overwrite tracked content unexpectedly.
++
++Cleanup **MUST** remove links themselves without deleting their targets.
++
++### 9.3 Sparse checkout
++
++Claude's `worktree.sparsePaths` setting contains repository-root-relative directories. Root-level files and the listed directories are checked out; the default is the full tree. **[DOCUMENTED]**
++
++OpenCode **SHOULD** support this setting. If unsupported, it **MUST** either reject the request when the setting is present or clearly warn that the checkout will not be sparse.
++
++---
++
++## 10. `WorktreeCreate` hook compatibility
++
++### 10.1 Replacement semantics
++
++If at least one applicable `WorktreeCreate` hook is configured, custom creation replaces default Git creation entirely. The harness **MUST NOT** also run `git worktree add`, process `.worktreeinclude`, apply sparse checkout, or create the default branch. **[DOCUMENTED]**
++
++Command-hook support is **REQUIRED** for the core compatibility profile. HTTP and MCP-tool handlers are outside that profile. An unsupported configured handler **MUST** produce a clear startup error rather than being ignored. **[OPENCODE-DIVERGENCE]**
++
++### 10.2 Hook discovery
++
++Applicable hooks may come from:
++
++- Managed settings.
++- CLI-provided settings.
++- `.claude/settings.local.json`.
++- `.claude/settings.json`.
++- `~/.claude/settings.json`.
++- Enabled plugins.
++
++Claude combines hook entries across scopes. An identical handler declared in more than one settings file runs once; plugin or skill copies remain distinct. Worktree events do not support matchers; a supplied matcher has no filtering effect. A handler-level `if` applies only to tool events and therefore must not be used for a worktree hook. **[DOCUMENTED]**
++
++A minimum implementation **MUST** load command hooks from user, shared-project, project-local and CLI `--settings` sources. Those sources and worktree settings **MUST** use one resolver. Managed and plugin hook compatibility **SHOULD** follow the wider configuration system rather than being approximated locally.
++
++### 10.3 Input
++
++A command hook receives JSON on stdin. At minimum it contains:
++
++```json
++{
++  "session_id": "<session-id>",
++  "transcript_path": "<absolute-transcript-path>",
++  "cwd": "<launch-directory>",
++  "hook_event_name": "WorktreeCreate",
++  "name": "<supplied-or-generated-name>"
++}
++```
++
++The `name` sent to the hook is the supplied value before default Git path normalization. A controlled probe passed `feature/auth` unchanged. **[OBSERVED]**
++
++The hook runs in the current launch context. `${CLAUDE_PROJECT_DIR}` compatibility, where provided, points to the original project root and does not later follow the worktree. Hook code that needs the current checkout should use the JSON `cwd` field. **[DOCUMENTED]**
++
++### 10.4 Command output
++
++For a command handler:
++
++1. The last non-empty stdout line is the resulting worktree path.
++2. ANSI escape sequences are removed before interpreting it.
++3. Earlier stdout is ignored for path selection, but setup logs **SHOULD** go to stderr.
++4. A relative path is resolved against the hook's execution directory.
++5. Any non-zero exit status fails creation.
++6. Missing, non-directory or unsafe output fails creation.
++
++Unlike most Claude hooks, stdout is a path rather than a JSON decision. **[DOCUMENTED]**
++
++The returned directory may be outside `.claude/worktrees`, but it **MUST** be normalized and validated. Literal `.` or `..` segments in an absolute returned path and symlink traversal below the repository root are rejected by Claude Code. **[DOCUMENTED]**
++
++### 10.5 Multiple create hooks
++
++Claude Code runs matching hooks in parallel, but its public documentation does not define how conflicting path outputs from multiple `WorktreeCreate` handlers are selected. **[UNVERIFIED]**
++
++After deduplicating identical effective handlers, the core profile **MUST** reject multiple applicable `WorktreeCreate` command handlers before running any of them. This intentionally avoids concurrent setup side effects and undefined path arbitration. **[OPENCODE-DIVERGENCE]** (§18.5)
++
++### 10.6 Timeout and environment
++
++Command hooks default to a 600-second timeout and run without a controlling terminal. They inherit the parent process environment subject to normal subprocess scrubbing. `CLAUDE_ENV_FILE` is not available to `WorktreeCreate`. **[DOCUMENTED]**
++
++The harness **SHOULD** use the configured hook timeout. Setup requiring interactive terminal input is unsupported and **SHOULD** fail clearly rather than hang indefinitely.
++
++---
++
++## 11. Session context after creation
++
++After successful creation:
++
++- The session's primary working directory **MUST** be the session worktree.
++- File tools **MUST** resolve relative paths there.
++- Shell tools **MUST** start there.
++- Project instructions, settings, agents, skills and MCP configuration **MUST** be resolved for the worktree according to each subsystem's normal rules.
++- Git status and branch information **MUST** come from the worktree, not the launch checkout.
++- The session record **MUST** persist the absolute worktree path and enough identity to validate it on resume.
++
++Hook `${CLAUDE_PROJECT_DIR}` compatibility remains anchored to the original project root, while hook input `cwd` follows the worktree and subsequent directory changes. **[DOCUMENTED]**
++
++`SessionStart` runs after the session adopts the worktree. Repositories may use it to initialize environment variables through `CLAUDE_ENV_FILE`. A compatible implementation that supports Claude hooks **SHOULD** preserve this ordering.
++
++For a default Git-created worktree, Claude associates the transcript with the worktree as the session moves there; resume and session discovery follow it. A hook-created worktree keeps its transcript associated with the launch directory. **[DOCUMENTED]** OpenCode may store transcripts differently, but its session listing and resume behaviour **MUST** produce the same observable result.
++
++Project-scoped plugins and saved permission approvals are shared across worktrees of the same repository. Claude normally saves a worktree approval in the main checkout's `.claude/settings.local.json`, while shared `.claude/settings.json` follows the session's primary working directory. **[DOCUMENTED]** The core profile **SHOULD** preserve these sharing rules where the corresponding Claude configuration is supported.
++
++The core profile does not expose `EnterWorktree` or `ExitWorktree`, so the initial worktree remains current for that session. A later implementation of those tools **MUST** treat the binding as mutable, update resume identity and transcript discovery after each transition, and apply cleanup to the worktree actually being exited. **[OPENCODE-DESIGN]**
++
++---
++
++## 12. Isolation from the main checkout
++
++A worktree session is not merely a different starting directory. Claude Code actively prevents the isolated agent from writing through the main checkout. **[DOCUMENTED]**
++
++OpenCode **MUST** enforce these invariants for the entire core-profile session:
++
++1. `edit`, `write`, `apply_patch` and equivalent file mutation tools cannot target the protected checkout.
++2. Bash, PowerShell and monitor commands cannot run with a working directory that resolves to the protected checkout.
++3. Bash and monitor Git commands cannot redirect into the protected checkout through `git -C`, `--git-dir`, `GIT_DIR`, `GIT_WORK_TREE`, or a preceding `cd`.
++4. A Bash or monitor command whose structure prevents safe determination of its Git target must be rejected rather than guessed safe.
++
++Refusals **MUST** be returned as tool errors that identify the worktree boundary and allow the model to reformulate the action. Permission approval **MUST NOT** override this isolation boundary.
++
++On Windows, path identity checks **MUST** follow filesystem case behaviour and normalize drive letters. Public issue reports show that case-sensitive comparisons have broken worktree isolation and resume. **[ISSUE-REPORTED]**
++
++---
++
++## 13. Interactive exit and cleanup
++
++### 13.1 Work detection
++
++At interactive session exit, the harness **MUST** inspect the worktree for:
++
++- Modified tracked files.
++- Staged changes.
++- Untracked files.
++- Every commit added since the worktree base, whether pushed or unpushed.
++
++### 13.2 Decision table
++
++Claude Code documents this behaviour:
++
++| Session state | Worktree state | Behaviour |
++| --- | --- | --- |
++| Unnamed session | Clean, no new commits | Remove worktree and branch automatically |
++| Named session | Clean, no new commits | Prompt to keep or remove |
++| Any session | Changes, untracked files or new commits | Prompt to keep or remove |
++
++Here, "named" means the session display name, not the `-w` value. **[DOCUMENTED]**
++
++Keeping preserves both the directory and branch for later resume. Removing deletes the worktree and branch, including uncommitted and committed work that exists only there. The destructive choice **MUST** be explicit whenever work would be lost.
++
++### 13.3 Non-interactive exit
++
++Claude Code `-p` runs do not show an exit prompt and leave their worktrees in place. They may remain Git-locked until a later stale-lock sweep. **[DOCUMENTED]**
++
++An OpenCode non-interactive equivalent **MUST** keep every created worktree by default, including a clean one. It may remove one only when the user supplied an explicit non-interactive cleanup option.
++
++### 13.4 Crashes and signals
++
++A crash or forced termination **MUST NOT** trigger destructive cleanup based on an assumption that the worktree is clean. A later sweep **MAY** release an OpenCode-owned stale lock after verifying that no owner process remains. It **MUST NOT** release user-created Git worktree locks.
++
++---
++
++## 14. `WorktreeRemove` hook compatibility
++
++`WorktreeRemove` fires when the system has decided to remove a worktree: at session exit after a remove choice, after an isolated subagent finishes, or when a background session is deleted. It may therefore accompany default Git cleanup or custom cleanup. **[DOCUMENTED]**
++
++The command hook receives:
++
++```json
++{
++  "session_id": "<session-id>",
++  "transcript_path": "<absolute-transcript-path>",
++  "cwd": "<current-directory>",
++  "hook_event_name": "WorktreeRemove",
++  "worktree_path": "<absolute-worktree-path>"
++}
++```
++
++The hook **MUST** use `worktree_path` as the cleanup target; `cwd` is not a substitute.
++
++Remove hooks perform side effects only:
++
++- They cannot block a removal already approved by the lifecycle.
++- Exit code `2` has no special blocking meaning.
++- Failures are logged but do not become permission decisions.
++- JSON decision fields are ignored.
++
++**[DOCUMENTED]**
++
++When custom creation was used, the harness **MUST NOT** assume the directory is a Git worktree. A configured `WorktreeRemove` hook owns custom cleanup. Without one, the custom directory **MUST** be retained rather than deleted by an unsafe generic fallback.
++
++For default Git creation, cleanup **MUST** use Git-aware removal, delete only the OpenCode/Claude-owned branch, remove only links rather than linked targets, and prune its own metadata safely.
++
++---
++
++## 15. Resume behaviour
++
++A kept worktree is part of the session's durable identity.
++
++When that session is resumed through the interactive picker, `--continue`, an explicit session ID, or a non-interactive entry point, OpenCode **MUST**:
++
++1. Load the stored worktree binding.
++2. Verify that the path still exists and remains safe to adopt. A Git-created worktree must remain a checkout distinct from the protected checkout. A custom hook-created directory may have no Git metadata, so verification instead uses the persisted hook provenance and path-safety record.
++3. Re-enter it before model execution and before exposing file or shell tools.
++4. Keep all filesystem, Git and instruction context anchored there.
++
++The user **MUST NOT** need to pass `-w` again for a valid stored binding. Claude Code's documentation promises this, although versions through at least 2.1.233 have public reports of bare `--resume` incorrectly returning to the main checkout. **[DOCUMENTED] [ISSUE-REPORTED]** OpenCode should implement the intended behaviour, not the bug.
++
++Claude's documented recovery matrix is:
++
++| Verification outcome | Interactive resume | Non-interactive resume | Binding |
++| --- | --- | --- | --- |
++| Directory is gone | Warn and continue in launch directory | Print notice and continue | Clear |
++| Verification failed transiently | Warn and continue in launch directory | Abort before session starts | Keep for retry |
++| Path is verified unsafe | Warn and continue in launch directory | Abort before session starts | Clear |
++| Launch context cannot vouch for the path | Warn and continue in launch directory | Abort before session starts | Keep; advise launching from the parent checkout |
++
++OpenCode **MUST NOT** enter an unverified path. Whenever interactive mode continues outside the worktree, it **MUST** state that isolation is inactive before model execution. **[DOCUMENTED]**
++
++Forking a conversation from a worktree-bound session **SHOULD** start in the directory from which the fork command is launched and leave the original binding untouched, matching Claude Code's documented `--fork-session` behaviour.
++
++---
++
++## 16. Symlink and path safety
++
++Default creation **MUST** reject `.claude`, `.claude/worktrees`, or the selected managed worktree path when any is a symlink. Claude Code does this to prevent repository-controlled redirection outside the expected destination. **[DOCUMENTED]**
++
++The harness **MUST**:
++
++- Canonicalize existing ancestors before containment checks.
++- Reject traversal through a symlink below the trusted repository boundary during creation.
++- For a Git-created or Git-backed path, validate the Git common directory and working-tree identity before adoption.
++- For a non-Git hook-created path, validate persisted hook provenance and canonical path identity without requiring Git metadata.
++- Reject a destination that contains the protected checkout.
++- Avoid following directory links while recursively removing a worktree.
++- Reject network paths where safe worktree identity cannot be established. **[OPENCODE-DESIGN]**
++
++An invalid or suspicious directory **MUST** be left in place for manual recovery unless the harness can prove it created the directory during the current failed transaction and that it contains no pre-existing work.
++
++---
++
++## 17. Resolution algorithm
++
++Normative summary for `opencode --worktree [name]`:
++
++1. Parse the optional worktree name without consuming OpenCode's project positional incorrectly.
++2. Resolve the launch directory and the available project identity.
++3. Apply trust and permission checks for project-controlled setup.
++4. Generate a name when absent.
++5. Load applicable worktree settings and lifecycle hooks.
++6. If `WorktreeCreate` applies, run it and validate its returned directory without requiring Git metadata.
++7. Otherwise require Git, resolve the project root, protected checkout, common directory and base, then reuse a valid named worktree or create the default Git worktree.
++8. For default creation, apply `.worktreeinclude` and process optional sparse paths and shared directories according to §9.
++9. Verify isolation, record ownership and acquire any lifecycle lock.
++10. Persist the session-to-worktree binding.
++11. Start the session with its working directory set to the worktree.
++12. On interactive exit, inspect work and apply the cleanup decision table.
++13. On resume, validate and re-enter the persisted worktree before model execution.
++
++At no point may failure silently degrade to an unisolated session in the main checkout.
++
++---
++
++## 18. Decisions delegated to the implementer
++
++### 18.1 OpenCode positional compatibility
++
++OpenCode currently interprets its default positional as a project path, while Claude interprets it as a prompt. Preserve `opencode <project>`. The normative core-profile worktree prompt form is `opencode -w [name] --prompt <text>`. Not accepting Claude's trailing prompt positional is an intentional compatibility limit. **[OPENCODE-DIVERGENCE]**
++
++### 18.2 Launching from a linked worktree
++
++Use the launch worktree as the source context and place managed descendants under that checkout's `<project-root>/.claude/worktrees`. Resolve `worktree.baseRef` normally: only `head` uses the launch worktree's `HEAD`, while `fresh` follows §7.2. Git identity must come from Git metadata rather than string-prefix heuristics. This follows the intended behaviour described after Claude Code 2.1.157. **[ISSUE-REPORTED]**
++
++### 18.3 Complex name normalization
++
++Simple names are specified. Probe current Claude behaviour for `/`, `\\`, Unicode, whitespace, leading dots, Git ref metacharacters and platform-reserved names before promising byte-for-byte parity.
++
++### 18.4 Failed-creation rollback
++
++Rollback newly created branches, registrations and empty directories where ownership is certain. Preserve anything pre-existing or containing work. Exact failure-stage cleanup is not fully documented upstream.
++
++### 18.5 Multiple create hooks
++
++Upstream runs hook handlers concurrently but does not document path arbitration. The core profile rejects multiple create handlers before execution, avoiding undefined selection and orphaned side effects. **[OPENCODE-DIVERGENCE]**
++
++### 18.6 Wider hook system
++
++This specification requires command-form worktree hooks because they are the common repository setup mechanism. HTTP hooks, MCP-tool hooks, managed-only policies, plugin hooks and generic Claude hook events belong in a broader hook-compatibility design. **[OPENCODE-DIVERGENCE]**
++
++### 18.7 `--tmux`
++
++Claude supports `--tmux` only with `--worktree`. It is outside the core profile and must report that it is unsupported rather than being ignored. **[OPENCODE-DIVERGENCE]**
++
++---
++
++## 19. Conformance tests
++
++### CLI and naming
++
++1. `-w name` and `--worktree name` select the same worktree name.
++2. `-w` with no value generates a non-empty, collision-resistant name.
++3. The generated or supplied name reaches `WorktreeCreate` unchanged.
++4. Worktree name and session display name remain independent.
++5. `opencode <project>` still opens that project without worktree mode.
++6. `--prompt` is delivered only after successful worktree setup.
++7. An explicit session name is recorded independently and changes clean-exit prompting.
++
++### Default Git creation
++
++8. A simple name creates `.claude/worktrees/<name>` and branch `worktree-<name>`.
++9. A repository without commits fails before session startup.
++10. A non-Git directory fails without a custom hook.
++11. `fresh` uses the remote default when available.
++12. `head` uses the launch checkout's exact local `HEAD`.
++13. Uncommitted source changes do not leak into a normal worktree.
++14. Reusing a valid existing name opens it without creating a duplicate.
++15. An invalid existing directory is rejected, not adopted.
++
++### Setup
++
++16. `.worktreeinclude` copies matching ignored files.
++17. `.worktreeinclude` does not copy tracked or non-ignored files.
++18. `.worktreeinclude` cannot escape the worktree through traversal or symlinks.
++19. When shared-directory support is implemented, configured directories are linked without making their targets cleanup-owned.
++20. When sparse-checkout support is implemented, sparse paths check out the requested directories and root files.
++
++### Hooks
++
++21. A command `WorktreeCreate` hook receives the documented JSON fields.
++22. Its last non-empty stdout line selects the worktree path.
++23. A relative hook result resolves against the hook working directory.
++24. A non-zero create hook exit fails startup.
++25. A missing or unsafe returned directory fails startup.
++26. Custom creation works without Git metadata and suppresses default Git creation and `.worktreeinclude`.
++27. Multiple create handlers are rejected before any handler runs.
++28. `WorktreeRemove` receives the absolute path originally returned by creation.
++29. A remove-hook failure cannot redirect cleanup to another path.
++
++### Session and isolation
++
++30. The session cwd, shell cwd, Git status and file tools all use the worktree.
++31. Project instructions are loaded relative to the worktree's project root.
++32. File mutation targeting the protected checkout is rejected.
++33. Shell cwd and Git redirection into the protected checkout are rejected.
++34. A failed isolation check never silently falls back to the main checkout.
++35. Default Git and hook-created worktrees remain discoverable according to their documented transcript association.
++
++### Cleanup and resume
++
++36. A clean unnamed interactive session is removed automatically.
++37. A clean named session prompts to keep or remove.
++38. Any worktree with changes, untracked files or new commits prompts, including pushed commits.
++39. Keeping preserves both directory and branch.
++40. Removing a dirty worktree requires an explicit destructive choice.
++41. Non-interactive exit keeps the worktree by default.
++42. Resume re-enters a valid kept worktree before model execution.
++43. Gone, transiently unverifiable, unsafe and unvouched worktrees follow the documented recovery matrix.
++44. Automated cleanup never removes an unmarked user-created worktree.
++45. Removing a worktree containing directory links leaves link targets intact.
++
++---
++
++## 20. Known deltas in current OpenCode
++
++Observed in the current repository while researching this specification:
++
++- The default CLI has no `-w` / `--worktree` option.
++- The default TUI CLI has no `--name` / `-n` session-name option tied to cleanup semantics.
++- OpenCode's existing worktree service creates checkouts under its global data directory rather than `<repo>/.claude/worktrees/`.
++- It creates `opencode/<name>` branches rather than `worktree-<name>` branches.
++- It lowercases and slugifies supplied names, appends a generated suffix on collisions, and does not reopen an existing name with Claude's reuse semantics.
++- Its current Git creation starts from local `HEAD`; there is no Claude-compatible `fresh` base selection.
++- It supports a database-backed project startup command, but not Claude's `WorktreeCreate` and `WorktreeRemove` command-hook protocol.
++- It does not process `.worktreeinclude`, `worktree.symlinkDirectories`, or `worktree.sparsePaths` in the examined creation path.
++- Worktree creation is exposed through the server/UI, not as a synchronous CLI startup transaction.
++- Its service returns after scheduling checkout reset, project loading and startup scripts in a background fiber. CLI `-w` requires a separate readiness boundary before model execution.
++- Removal is an explicit server/UI operation rather than Claude's interactive session-exit decision table.
++- The current removal primitive force-removes registered worktrees and their branches, and recursively deletes an unregistered target, without checking an OpenCode ownership marker. It **MUST NOT** be reused for automatic lifecycle cleanup until ownership is validated.
++- Session resume does not currently establish the Claude-style durable `-w` binding because CLI-created worktree sessions do not exist yet.
++- The existing service already has useful primitives for creation, listing, reset, project sandbox registration and startup commands. A compatible implementation should reuse safe pieces while strengthening creation readiness and removal ownership checks.
++
++---
++
++## 21. Sources
++
++Primary documentation:
++
++- [Claude Code worktrees](https://code.claude.com/docs/en/worktrees)
++- [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference)
++- [Claude Code hooks reference](https://code.claude.com/docs/en/hooks)
++- [Claude Code settings reference](https://code.claude.com/docs/en/settings-reference#worktree)
++- [Claude Code session management](https://code.claude.com/docs/en/sessions)
++- [Git worktree documentation](https://git-scm.com/docs/git-worktree)
++
++Selected issue evidence:
++
++- [anthropics/claude-code#85339](https://github.com/anthropics/claude-code/issues/85339): resume returning a kept worktree session to the main checkout; collaborator-confirmed through 2.1.233.
++- [anthropics/claude-code#23622](https://github.com/anthropics/claude-code/issues/23622): base-branch limitations and the later `worktree.baseRef` setting.
++- [anthropics/claude-code#42600](https://github.com/anthropics/claude-code/issues/42600): slash normalization in worktree and branch names.
++- [anthropics/claude-code#63779](https://github.com/anthropics/claude-code/issues/63779): invocation from an existing linked worktree.
++- [anthropics/claude-code#67384](https://github.com/anthropics/claude-code/issues/67384): default branch-prefix behaviour and custom-hook workaround.
++
++Local observations used no model request. Controlled probes installed a failing `WorktreeCreate` hook so argument parsing and hook input could be observed before a session or API call began.
++
++---
++
++Written by Claude - review for accuracy
+diff --git a/packages/opencode/src/cli/cmd/run.ts b/packages/opencode/src/cli/cmd/run.ts
+index cccc255017..4935525f61 100644
+--- a/packages/opencode/src/cli/cmd/run.ts
++++ b/packages/opencode/src/cli/cmd/run.ts
+@@ -19,7 +19,7 @@ import { pathToFileURL } from "url"
+ import { open } from "node:fs/promises"
+ import { Effect } from "effect"
+ import { UI } from "../ui"
+-import { effectCmd } from "../effect-cmd"
++import { effectCmd, fail } from "../effect-cmd"
+ import { EOL } from "os"
+ import { Filesystem } from "@/util/filesystem"
+ import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
+@@ -131,7 +131,11 @@ export const RunCommand = effectCmd({
+   instance: (args) => !args.attach,
+   // For --dir without --attach, load instance for the resolved target dir.
+   // The handler also chdirs (preserving the legacy order: chdir → file resolution).
+-  directory: (args) => (args.dir && !args.attach ? path.resolve(process.cwd(), args.dir) : process.cwd()),
++  directory: async (args) => {
++    const launch = args.dir && !args.attach ? path.resolve(process.cwd(), args.dir) : process.cwd()
++    const { resolveDirectory } = await import("@/cli/worktree")
++    return resolveDirectory(args, launch, { interactive: Boolean(args.mini) })
++  },
+   builder: (yargs: Argv) =>
+     yargs
+       .positional("message", {
+@@ -144,6 +148,29 @@ export const RunCommand = effectCmd({
+         describe: "the command to run, use message for args",
+         type: "string",
+       })
++      .option("prompt", {
++        describe: "message to send when using an option with an optional value",
++        type: "string",
++      })
++      .option("worktree", {
++        alias: ["w"],
++        describe: "start the session in a new or existing worktree",
++        type: "string",
++        requiresArg: false,
++      })
++      .option("name", {
++        alias: ["n"],
++        describe: "name for the session",
++        type: "string",
++      })
++      .option("settings", {
++        describe: "Claude settings JSON or path used for worktree hooks",
++        type: "string",
++      })
++      .option("tmux", {
++        type: "boolean",
++        hidden: true,
++      })
+       .option("continue", {
+         alias: ["c"],
+         describe: "continue the last session",
+@@ -261,6 +288,8 @@ export const RunCommand = effectCmd({
+         describe: "enable direct interactive demo slash commands; pass one as the message to run it immediately",
+       }),
+   handler: Effect.fn("Cli.run")(function* (args) {
++    if (args.attach && args.worktree !== undefined) return yield* fail("--worktree cannot be used with --attach")
++    if (args.tmux) return yield* fail("--tmux worktree sessions are not supported")
+     const { Agent } = yield* Effect.promise(() => import("@/agent/agent"))
+     const { RuntimeFlags } = yield* Effect.promise(() => import("@/effect/runtime-flags"))
+     const { InstanceRef } = yield* Effect.promise(() => import("@/effect/instance-ref"))
+@@ -269,7 +298,6 @@ export const RunCommand = effectCmd({
+     const flags = yield* RuntimeFlags.Service
+     const localInstance = yield* InstanceRef
+     yield* Effect.promise(async () => {
+-      const rawMessage = [...args.message, ...(args["--"] || [])].join(" ")
+       const interactive = args.mini
+       const auto = args.auto || args.yolo || args["dangerously-skip-permissions"]
+       const thinking = interactive ? (args.thinking ?? true) : (args.thinking ?? false)
+@@ -284,10 +312,16 @@ export const RunCommand = effectCmd({
+ 
+         throw error
+       }
++      if (args.prompt !== undefined && (args.message.length > 0 || (args["--"]?.length ?? 0) > 0)) {
++        die("--prompt cannot be combined with a positional message")
++      }
++      const rawMessage = args.prompt ?? [...args.message, ...(args["--"] || [])].join(" ")
+ 
+-      let message = [...args.message, ...(args["--"] || [])]
+-        .map((arg) => (arg.includes(" ") ? `"${arg.replace(/"/g, '\\"')}"` : arg))
+-        .join(" ")
++      let message =
++        args.prompt ??
++        [...args.message, ...(args["--"] || [])]
++          .map((arg) => (arg.includes(" ") ? `"${arg.replace(/"/g, '\\"')}"` : arg))
++          .join(" ")
+ 
+       if (interactive && args.command) {
+         die("--mini cannot be used with --command")
+@@ -330,9 +364,15 @@ export const RunCommand = effectCmd({
+ 
+       const replay = args.replay === false ? false : args.replay || args["replay-limit"] !== undefined
+ 
++      const { sessionInput, state: worktreeState } = await import("@/cli/worktree")
++      const prepared = worktreeState(args)
+       const root = Filesystem.resolve(process.env.PWD ?? process.cwd())
+       const directory = (() => {
+-        if (!args.dir) return args.attach ? undefined : root
++        if (prepared) {
++          process.chdir(prepared.binding.directory)
++          return prepared.binding.directory
++        }
++        if (!args.dir) return args.attach ? undefined : (localInstance?.directory ?? root)
+         if (args.attach) return args.dir
+ 
+         try {
+@@ -448,6 +488,7 @@ export const RunCommand = effectCmd({
+           ]
+ 
+       function title() {
++        if (args.name !== undefined) return args.name
+         if (args.title === undefined) return
+         if (args.title !== "") return args.title
+         return message.slice(0, 50) + (message.length > 50 ? "..." : "")
+@@ -516,8 +557,11 @@ export const RunCommand = effectCmd({
+         }
+ 
+         const name = title()
++        const worktree = sessionInput(args)
+         const result = await sdk.session.create({
+-          title: name,
++          id: worktree?.id,
++          title: worktree?.title ?? name,
++          metadata: worktree?.metadata,
+           permission: [...rules],
+         })
+         const id = result.data?.id
+@@ -551,8 +595,12 @@ export const RunCommand = effectCmd({
+         sdk: OpencodeClient,
+         input: { agent: string | undefined; model: ModelInput | undefined; variant: string | undefined },
+       ): Promise<SessionInfo> {
++        const worktree = sessionInput(args)
+         const result = await sdk.session.create({
+-          title: args.title !== undefined && args.title !== "" ? args.title : undefined,
++          id: worktree?.id,
++          title:
++            worktree?.title ?? args.name ?? (args.title !== undefined && args.title !== "" ? args.title : undefined),
++          metadata: worktree?.metadata,
+           agent: input.agent,
+           model: input.model
+             ? {
+@@ -960,6 +1008,8 @@ export const RunCommand = effectCmd({
+       })
+       await execute(sdk)
+     })
++    const { finish: finishWorktree } = yield* Effect.promise(() => import("@/cli/worktree"))
++    yield* Effect.promise(() => finishWorktree(args, Boolean(args.mini), Boolean(args.name ?? args.title)))
+   }),
+ })
+ 
+@@ -974,6 +1024,9 @@ type MiniCommandInput = {
+   model?: string
+   agent?: string
+   prompt?: string
++  worktree?: string
++  name?: string
++  settings?: string
+   replay?: boolean
+   replayLimit?: number
+   demo?: boolean
+@@ -985,6 +1038,11 @@ export async function runMini(input: MiniCommandInput) {
+     $0: "opencode",
+     _: ["mini"],
+     message: input.prompt ? [input.prompt] : [],
++    prompt: undefined,
++    worktree: input.worktree,
++    name: input.name,
++    settings: input.settings,
++    tmux: undefined,
+     command: undefined,
+     continue: input.continue,
+     session: input.session,
+diff --git a/packages/opencode/src/cli/cmd/tui.ts b/packages/opencode/src/cli/cmd/tui.ts
+index d5fa46bfb1..b2c4af9765 100644
+--- a/packages/opencode/src/cli/cmd/tui.ts
++++ b/packages/opencode/src/cli/cmd/tui.ts
+@@ -101,6 +101,25 @@ export const TuiThreadCommand = cmd({
+         type: "string",
+         describe: "prompt to use",
+       })
++      .option("worktree", {
++        alias: ["w"],
++        type: "string",
++        requiresArg: false,
++        describe: "start the session in a new or existing worktree",
++      })
++      .option("name", {
++        alias: ["n"],
++        type: "string",
++        describe: "name for the session",
++      })
++      .option("settings", {
++        type: "string",
++        describe: "Claude settings JSON or path used for worktree hooks",
++      })
++      .option("tmux", {
++        type: "boolean",
++        hidden: true,
++      })
+       .option("agent", {
+         type: "string",
+         describe: "agent to use",
+@@ -142,6 +161,11 @@ export const TuiThreadCommand = cmd({
+         hidden: true,
+       }),
+   handler: async (args) => {
++    if (args.tmux) {
++      UI.error("--tmux worktree sessions are not supported")
++      process.exitCode = 1
++      return
++    }
+     if (args.replay === true) {
+       UI.error("--replay is not supported; replay is enabled by default")
+       process.exitCode = 1
+@@ -168,6 +192,9 @@ export const TuiThreadCommand = cmd({
+         model: args.model,
+         agent: args.agent,
+         prompt: args.prompt,
++        worktree: args.worktree,
++        name: args.name,
++        settings: args.settings,
+         replay: noReplay ? false : undefined,
+         replayLimit: args.replayLimit,
+         demo: args.demo,
+@@ -197,7 +224,9 @@ export const TuiThreadCommand = cmd({
+ 
+       // Resolve relative --project paths from PWD, then use the real cwd after
+       // chdir so the thread and worker share the same directory key.
+-      const next = resolveThreadDirectory(args.project)
++      const launch = resolveThreadDirectory(args.project)
++      const { resolveDirectory, sessionInput, finish: finishWorktree } = await import("@/cli/worktree")
++      const next = await resolveDirectory(args, launch, { interactive: true })
+       const file = await target()
+       try {
+         process.chdir(next)
+@@ -292,9 +321,14 @@ export const TuiThreadCommand = cmd({
+               prompt,
+               fork: args.fork,
+               auto: args.auto || args.yolo || args["dangerously-skip-permissions"],
++              name: args.name,
++              session: sessionInput(args),
+             },
+           }),
+         )
++        process.chdir(launch)
++        await stop()
++        await finishWorktree(args, true, Boolean(args.name))
+       } finally {
+         await stop()
+       }
+diff --git a/packages/opencode/src/cli/effect-cmd.ts b/packages/opencode/src/cli/effect-cmd.ts
+index 9ac2bd3555..bccd19d3f2 100644
+--- a/packages/opencode/src/cli/effect-cmd.ts
++++ b/packages/opencode/src/cli/effect-cmd.ts
+@@ -45,7 +45,7 @@ interface EffectCmdOpts<Args, A> {
+    */
+   instance?: boolean | ((args: Args) => boolean)
+   /** Defaults to process.cwd(). Override for commands that take a directory positional. */
+-  directory?: (args: Args) => string
++  directory?: (args: Args) => string | Promise<string>
+   handler: (args: WithDoubleDash<Args>) => Effect.Effect<A, CliError, AppServices | InstanceStore.Service>
+ }
+ 
+@@ -83,7 +83,7 @@ export const effectCmd = <Args, A>(opts: EffectCmdOpts<Args, A>) =>
+       }
+       const { InstanceStore } = await import("@/project/instance-store")
+       const { InstanceRef } = await import("@/effect/instance-ref")
+-      const directory = opts.directory?.(args) ?? process.cwd()
++      const directory = (await opts.directory?.(args)) ?? process.cwd()
+       const { store, ctx } = await AppRuntime.runPromise(
+         InstanceStore.Service.use((store) => store.load({ directory }).pipe(Effect.map((ctx) => ({ store, ctx })))),
+       )
+diff --git a/packages/opencode/src/cli/worktree.ts b/packages/opencode/src/cli/worktree.ts
+new file mode 100644
+index 0000000000..77175ab877
+--- /dev/null
++++ b/packages/opencode/src/cli/worktree.ts
+@@ -0,0 +1,968 @@
++import { Global } from "@opencode-ai/core/global"
++import { Slug } from "@opencode-ai/core/util/slug"
++import { SessionID } from "@/session/schema"
++import ignore from "ignore"
++import { parse } from "jsonc-parser"
++import path from "node:path"
++import stripAnsi from "strip-ansi"
++
++export const MetadataKey = "opencode.worktree"
++
++type Hook = {
++  command: string
++  timeout: number
++}
++
++export type Binding = {
++  version: 1
++  sessionID: string
++  name: string
++  sessionName?: string
++  directory: string
++  launchDirectory: string
++  projectRoot: string
++  protectedDirectories: string[]
++  base: string
++  branch?: string
++  provenance: "git" | "hook"
++  marker?: string
++  removeHook?: Hook
++  timeCreated: number
++}
++
++type State = {
++  binding: Binding
++  created: boolean
++  claimed: boolean
++  ownerFile: string
++}
++
++type Args = {
++  worktree?: string
++  name?: string
++  settings?: string
++  session?: string
++  continue?: boolean
++  fork?: boolean
++  attach?: string
++  tmux?: boolean
++  auto?: boolean
++  yolo?: boolean
++  dangerouslySkipPermissions?: boolean
++  "dangerously-skip-permissions"?: boolean
++}
++
++type ClaudeSettings = {
++  worktree?: {
++    baseRef?: "fresh" | "head"
++    symlinkDirectories?: string[]
++    sparsePaths?: string[]
++  }
++  hooks?: Record<string, unknown>
++}
++
++const states = new WeakMap<object, State>()
++const SIMPLE_NAME = /^[A-Za-z0-9_-]+$/
++const ANSI_ESCAPE = /(?:\u001B\[[0-?]*[ -/]*[@-~])/g
++
++export function requested(args: Args) {
++  return args.worktree !== undefined
++}
++
++export function state(args: object) {
++  return states.get(args)
++}
++
++export function sessionInput(args: object) {
++  const current = states.get(args)
++  if (!current?.created || current.claimed) return undefined
++  current.claimed = true
++  return {
++    id: current.binding.sessionID,
++    title: current.binding.sessionName,
++    metadata: { [MetadataKey]: current.binding },
++  }
++}
++
++export async function resolveDirectory(args: Args, launchDirectory: string, options?: { interactive?: boolean }) {
++  const launch = await canonical(launchDirectory)
++  if (args.tmux && !requested(args)) throw new Error("--tmux requires --worktree and is not supported")
++  if (requested(args)) return create(args, launch, options?.interactive === true)
++  if (args.fork) return launch
++
++  const persisted = args.continue ? await latestPersistedBinding(launch) : undefined
++  const binding = args.session
++    ? ((await readBinding(args.session)) ?? (await readSessionBinding(args.session)))
++    : args.continue
++      ? persisted?.available
++        ? persisted.binding
++        : await latestBinding(launch)
++      : undefined
++  if (!binding) return launch
++
++  const vouched = await canVouch(binding, launch)
++  if (!vouched) {
++    if (!options?.interactive)
++      throw new Error(`Launch directory cannot verify the worktree for session ${binding.sessionID}`)
++    args.session = binding.sessionID
++    args.continue = false
++    process.env.OPENCODE_WORKTREE_DISABLED_SESSION = binding.sessionID
++    process.stderr.write(
++      `Launch directory cannot verify the worktree for session ${binding.sessionID}; isolation is inactive.\n`,
++    )
++    return launch
++  }
++
++  const verified = await verify(binding)
++  if (verified === "gone" || verified === "unsafe") {
++    await removeBinding(binding.sessionID)
++    args.session = binding.sessionID
++    args.continue = false
++    process.env.OPENCODE_WORKTREE_DISABLED_SESSION = binding.sessionID
++    await moveSessionRecord(binding.sessionID, launch)
++    process.stderr.write(`Worktree for session ${binding.sessionID} is unavailable; continuing in ${launch}.\n`)
++    return launch
++  }
++  if (verified !== "valid") {
++    if (!options?.interactive) throw new Error(`Could not verify the worktree for session ${binding.sessionID}`)
++    args.session = binding.sessionID
++    args.continue = false
++    process.env.OPENCODE_WORKTREE_DISABLED_SESSION = binding.sessionID
++    process.stderr.write(`Could not verify the worktree for session ${binding.sessionID}; isolation is inactive.\n`)
++    return launch
++  }
++  if (args.continue) {
++    args.session = binding.sessionID
++    args.continue = false
++  }
++  const adopted = { ...binding }
++  const ownerFile = await registerOwner(adopted)
++  await writeBinding(adopted)
++  states.set(args, { binding: adopted, created: false, claimed: true, ownerFile })
++  return adopted.directory
++}
++
++async function create(args: Args, launchDirectory: string, interactive: boolean) {
++  if (args.session || args.continue || args.fork)
++    throw new Error("--worktree cannot be combined with session resume or fork options")
++  if (args.attach) throw new Error("--worktree cannot be used with --attach")
++  if (args.tmux) throw new Error("--tmux worktree sessions are not supported")
++
++  const supplied = args.worktree?.trim()
++  if (supplied && (supplied.startsWith("#") || /^https?:\/\/(?:www\.)?(?:github|gitlab)\.com\//i.test(supplied))) {
++    throw new Error("Pull request and merge request worktrees are not supported")
++  }
++
++  const name = supplied || `${Slug.create()}-${crypto.randomUUID().slice(0, 6)}`
++  const sessionID = SessionID.create()
++  const repository = await discover(launchDirectory)
++  const projectRoot = repository?.worktree ?? launchDirectory
++  const settings = await loadSettings(projectRoot, args.settings)
++  const createHooks = hooks(settings, "WorktreeCreate")
++  const removeHooks = hooks(settings, "WorktreeRemove")
++  if (createHooks.length > 1) throw new Error("Multiple WorktreeCreate command hooks are not supported")
++  if (removeHooks.length > 1) throw new Error("Multiple WorktreeRemove command hooks are not supported")
++  if ((createHooks.length || removeHooks.length) && interactive) {
++    const prompts = await import("@clack/prompts")
++    const trusted = await prompts.confirm({
++      message: `Run the WorktreeCreate hook configured by ${projectRoot}?`,
++      initialValue: false,
++    })
++    if (prompts.isCancel(trusted) || !trusted)
++      throw new Error("Worktree creation cancelled; project hook was not trusted")
++  }
++  if (
++    (createHooks.length || removeHooks.length) &&
++    !interactive &&
++    !args.auto &&
++    !args.yolo &&
++    !args.dangerouslySkipPermissions &&
++    !args["dangerously-skip-permissions"]
++  ) {
++    throw new Error("Non-interactive worktree hooks require --auto or --dangerously-skip-permissions")
++  }
++
++  const transcriptPath = path.join(Global.Path.data, "worktree-transcript", `${sessionID}.jsonl`)
++  await Bun.write(transcriptPath, "")
++  const protectedDirectories = repository
++    ? [
++        ...new Set(
++          [launchDirectory, repository.worktree, await canonicalGitMain(repository.commonDirectory)].filter(Boolean),
++        ),
++      ]
++    : [launchDirectory]
++
++  const result = createHooks[0]
++    ? await createFromHook({
++        hook: createHooks[0],
++        sessionID,
++        transcriptPath,
++        launchDirectory,
++        projectRoot,
++        protectedDirectories,
++        name,
++      })
++    : await createFromGit({ repository, settings, name, projectRoot })
++  const binding: Binding = {
++    version: 1,
++    sessionID,
++    name,
++    sessionName: args.name,
++    directory: result.directory,
++    launchDirectory,
++    projectRoot,
++    protectedDirectories,
++    base: result.base,
++    branch: "branch" in result ? result.branch : undefined,
++    provenance: result.provenance,
++    marker: "marker" in result ? result.marker : undefined,
++    removeHook: removeHooks[0],
++    timeCreated: Date.now(),
++  }
++  const ownerFile = await registerOwner(binding)
++  await writeBinding(binding)
++  states.set(args, { binding, created: true, claimed: false, ownerFile })
++  return binding.directory
++}
++
++async function createFromHook(input: {
++  hook: Hook
++  sessionID: string
++  transcriptPath: string
++  launchDirectory: string
++  projectRoot: string
++  protectedDirectories: string[]
++  name: string
++}) {
++  const result = await shell(input.hook.command, input.launchDirectory, {
++    timeout: input.hook.timeout,
++    stdin: JSON.stringify({
++      session_id: input.sessionID,
++      transcript_path: input.transcriptPath,
++      cwd: input.launchDirectory,
++      hook_event_name: "WorktreeCreate",
++      name: input.name,
++    }),
++    env: { CLAUDE_PROJECT_DIR: input.projectRoot },
++  })
++  if (result.code !== 0) throw new Error(result.stderr.trim() || `WorktreeCreate hook exited with code ${result.code}`)
++  const output = stripAnsi(result.stdout.replace(ANSI_ESCAPE, ""))
++    .split(/\r?\n/)
++    .map((line) => line.trim())
++    .filter(Boolean)
++    .at(-1)
++  if (!output) throw new Error("WorktreeCreate hook did not return a worktree path")
++  if (path.isAbsolute(output) && output.split(/[\\/]/).some((part) => part === "." || part === "..")) {
++    throw new Error("WorktreeCreate hook returned an unsafe path")
++  }
++  const selected = path.resolve(input.launchDirectory, output)
++  if (contains(input.projectRoot, selected)) await assertNoSymlink(input.projectRoot, selected)
++  const directory = await canonical(selected)
++  if (!(await stat(directory))?.isDirectory()) {
++    throw new Error("WorktreeCreate hook did not return an existing directory")
++  }
++  assertCustomSeparate(directory, input.protectedDirectories)
++  return { directory, base: "hook", provenance: "hook" as const }
++}
++
++async function createFromGit(input: {
++  repository: Repository | undefined
++  settings: ClaudeSettings
++  name: string
++  projectRoot: string
++}) {
++  if (!input.repository) throw new Error("--worktree requires a Git repository or a WorktreeCreate hook")
++  if (!SIMPLE_NAME.test(input.name)) {
++    throw new Error(
++      "Worktree names for default Git creation may contain only letters, digits, underscores, and hyphens",
++    )
++  }
++  const branch = `worktree-${input.name}`
++  const ref = await git(input.projectRoot, ["check-ref-format", "--branch", branch])
++  if (ref.code !== 0) throw new Error(`Invalid worktree branch name: ${branch}`)
++
++  const root = path.join(input.projectRoot, ".claude", "worktrees")
++  await assertManagedPath(input.projectRoot, root)
++  const directory = path.join(root, input.name)
++  await assertNoSymlink(input.projectRoot, directory)
++  if ((await stat(directory))?.isDirectory()) {
++    const existing = await discover(directory)
++    if (!existing || !(await same(existing.commonDirectory, input.repository.commonDirectory))) {
++      throw new Error(`Existing path is not a worktree for this repository: ${directory}`)
++    }
++    assertSeparate(existing.worktree, [input.repository.worktree])
++    const currentBranch = (await git(directory, ["branch", "--show-current"])).stdout.trim()
++    const markerFile = await markerPath(existing)
++    const marker = await readMarker(markerFile)
++    const owned = marker && marker.directory === existing.worktree && marker.branch === currentBranch
++    return {
++      directory: existing.worktree,
++      base: marker?.base ?? (await git(directory, ["rev-parse", "HEAD"])).stdout.trim(),
++      branch: owned ? marker.branch : undefined,
++      provenance: "git" as const,
++      marker: owned ? markerFile : undefined,
++    }
++  }
++
++  const head = await git(input.projectRoot, ["rev-parse", "HEAD"])
++  if (head.code !== 0 || !head.stdout.trim())
++    throw new Error("Failed to resolve HEAD; the repository needs at least one commit")
++  const filters = await git(input.projectRoot, [
++    "config",
++    "--local",
++    "--get-regexp",
++    "^filter\\..*\\.(process|smudge)$",
++  ])
++  if (filters.code === 0 && filters.stdout.trim())
++    throw new Error("Repository-local Git filter commands prevent safe worktree creation")
++
++  const baseRef =
++    input.settings.worktree?.baseRef === "head"
++      ? head.stdout.trim()
++      : await freshBase(input.repository, head.stdout.trim())
++  const resolvedBase = await git(input.projectRoot, ["rev-parse", baseRef])
++  if (resolvedBase.code !== 0 || !resolvedBase.stdout.trim())
++    throw new Error(`Failed to resolve worktree base: ${baseRef}`)
++  const base = resolvedBase.stdout.trim()
++  await mkdir(root)
++  if (input.settings.worktree?.sparsePaths?.length) {
++    process.stderr.write("Warning: worktree.sparsePaths is not supported; creating a full checkout.\n")
++  }
++  if (input.settings.worktree?.symlinkDirectories?.length) {
++    process.stderr.write("Warning: worktree.symlinkDirectories is not supported and will not be applied.\n")
++  }
++  const created = await git(input.projectRoot, ["worktree", "add", "-b", branch, "--", directory, base])
++  if (created.code !== 0) throw new Error(created.stderr.trim() || "Failed to create Git worktree")
++
++  try {
++    const repository = await discover(directory)
++    if (!repository) throw new Error("Created worktree could not be verified")
++    assertSeparate(repository.worktree, [input.repository.worktree])
++    await copyIncluded(input.projectRoot, directory)
++    const marker = await markerPath(repository)
++    await Bun.write(
++      marker,
++      JSON.stringify({ version: 1, branch, directory: repository.worktree, base, created: Date.now() }),
++    )
++    return { directory: repository.worktree, base, branch, provenance: "git" as const, marker }
++  } catch (error) {
++    await git(input.projectRoot, ["worktree", "remove", "--force", directory])
++    await git(input.projectRoot, ["branch", "-D", branch])
++    throw error
++  }
++}
++
++export async function finish(args: object, interactive: boolean, named = false) {
++  const current = states.get(args)
++  if (!current || !interactive) return
++  const binding = (await readBinding(current.binding.sessionID)) ?? current.binding
++  process.chdir(binding.launchDirectory)
++  const release = await acquireOperationLock(binding.directory)
++  if (!release) {
++    process.stderr.write("Keeping worktree because another process is using its lifecycle lock.\n")
++    return
++  }
++  try {
++    if ((await verify(binding)) !== "valid") return
++    if (await hasActiveOwner(binding, current.ownerFile)) {
++      process.stderr.write("Keeping worktree because another session is active.\n")
++      return
++    }
++
++    const work = await hasWork(binding)
++    const needsPrompt = named || Boolean(binding.sessionName) || work
++    if (needsPrompt) {
++      const prompts = await import("@clack/prompts")
++      const answer = await prompts.select({
++        message: work ? "Keep this worktree and its changes?" : "Keep this named session worktree?",
++        options: [
++          { value: "keep", label: "Keep worktree" },
++          { value: "remove", label: work ? "Remove worktree and discard work" : "Remove worktree" },
++        ],
++        initialValue: "keep",
++      })
++      if (prompts.isCancel(answer) || answer !== "remove") return
++    }
++    if (await hasActiveOwner(binding, current.ownerFile)) return
++    if (!work && (await hasWork(binding))) {
++      process.stderr.write("Keeping worktree because work appeared while cleanup was pending.\n")
++      return
++    }
++    if (binding.provenance === "git" && (!binding.marker || !(await Bun.file(binding.marker).exists()))) {
++      process.stderr.write("Keeping worktree because its OpenCode ownership marker is missing.\n")
++      return
++    }
++    await remove(binding)
++    states.delete(args)
++  } finally {
++    await release()
++    const fs = await import("node:fs/promises")
++    await fs.rm(current.ownerFile, { force: true })
++  }
++}
++
++async function remove(binding: Binding) {
++  if (binding.removeHook) {
++    const transcriptPath = path.join(Global.Path.data, "worktree-transcript", `${binding.sessionID}.jsonl`)
++    const result = await shell(binding.removeHook.command, binding.directory, {
++      timeout: binding.removeHook.timeout,
++      stdin: JSON.stringify({
++        session_id: binding.sessionID,
++        transcript_path: transcriptPath,
++        cwd: binding.directory,
++        hook_event_name: "WorktreeRemove",
++        worktree_path: binding.directory,
++      }),
++      env: { CLAUDE_PROJECT_DIR: binding.projectRoot },
++    })
++    if (result.code !== 0)
++      process.stderr.write(result.stderr || `WorktreeRemove hook exited with code ${result.code}\n`)
++  }
++  if (binding.provenance === "hook") {
++    await removeBinding(binding.sessionID)
++    return
++  }
++  if (!binding.marker || !(await Bun.file(binding.marker).exists())) {
++    throw new Error("Refusing to remove a worktree without an OpenCode ownership marker")
++  }
++  const removed = await git(binding.projectRoot, ["worktree", "remove", "--force", binding.directory])
++  if (removed.code !== 0) throw new Error(removed.stderr.trim() || "Failed to remove worktree")
++  if (binding.branch) {
++    const branch = await git(binding.projectRoot, ["branch", "-D", binding.branch])
++    if (branch.code !== 0) throw new Error(branch.stderr.trim() || "Failed to remove worktree branch")
++  }
++  await removeBinding(binding.sessionID)
++}
++
++async function hasWork(binding: Binding) {
++  if (binding.provenance !== "git") return true
++  const status = await git(binding.directory, ["status", "--porcelain", "--untracked-files=all"])
++  if (status.code !== 0 || status.stdout.trim()) return true
++  const commits = await git(binding.directory, ["rev-list", "--count", `${binding.base}..HEAD`])
++  return commits.code !== 0 || Number.parseInt(commits.stdout.trim(), 10) > 0
++}
++
++async function verify(binding: Binding): Promise<"valid" | "gone" | "unsafe" | "failed"> {
++  if (!(await stat(binding.directory))?.isDirectory()) return "gone"
++  try {
++    const directory = await canonical(binding.directory)
++    if (binding.protectedDirectories.some((protectedDirectory) => contains(directory, protectedDirectory)))
++      return "unsafe"
++    if (binding.provenance === "hook") return directory === binding.directory ? "valid" : "unsafe"
++    const repository = await discover(directory)
++    const launch = await discover(binding.projectRoot)
++    if (!repository || !launch) return "unsafe"
++    if (!(await same(repository.commonDirectory, launch.commonDirectory))) return "unsafe"
++    return repository.worktree === directory ? "valid" : "unsafe"
++  } catch {
++    return "failed"
++  }
++}
++
++async function canVouch(binding: Binding, launchDirectory: string) {
++  if (binding.provenance === "hook") {
++    return contains(binding.launchDirectory, launchDirectory) || contains(launchDirectory, binding.launchDirectory)
++  }
++  const launch = await discover(launchDirectory)
++  const project = await discover(binding.projectRoot)
++  return Boolean(launch && project && (await same(launch.commonDirectory, project.commonDirectory)))
++}
++
++async function freshBase(repository: Repository, fallback: string) {
++  const controller = new AbortController()
++  const timeout = setTimeout(() => controller.abort(), 5000)
++  await git(repository.worktree, ["fetch", "origin", "--prune"], controller.signal).catch(() => undefined)
++  clearTimeout(timeout)
++
++  const symbolic = await git(repository.worktree, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
++  if (symbolic.code === 0 && symbolic.stdout.trim()) return symbolic.stdout.trim()
++  for (const candidate of ["origin/main", "origin/master"]) {
++    if ((await git(repository.worktree, ["rev-parse", "--verify", candidate])).code === 0) return candidate
++  }
++  return fallback
++}
++
++async function copyIncluded(sourceRoot: string, destinationRoot: string) {
++  const file = Bun.file(path.join(sourceRoot, ".worktreeinclude"))
++  if (!(await file.exists())) return
++  const matcher = ignore().add(await file.text())
++  const listed = await git(sourceRoot, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"])
++  if (listed.code !== 0) throw new Error(listed.stderr.trim() || "Failed to resolve .worktreeinclude files")
++  const files = listed.stdout.split("\0").filter((item) => item && matcher.ignores(item))
++  for (const relative of files) {
++    const source = path.resolve(sourceRoot, relative)
++    const destination = path.resolve(destinationRoot, relative)
++    if (!contains(sourceRoot, source) || !contains(destinationRoot, destination))
++      throw new Error(".worktreeinclude path escapes the worktree")
++    const info = await stat(source, true)
++    if (!info?.isFile() || info.isSymbolicLink()) throw new Error(`Unsafe .worktreeinclude source: ${relative}`)
++    await assertNoSymlink(destinationRoot, path.dirname(destination))
++    await mkdir(path.dirname(destination))
++    await Bun.write(destination, Bun.file(source))
++  }
++}
++
++async function loadSettings(projectRoot: string, cli?: string): Promise<ClaudeSettings> {
++  const files = [
++    path.join(Global.Path.home, ".claude", "settings.json"),
++    path.join(projectRoot, ".claude", "settings.json"),
++    path.join(projectRoot, ".claude", "settings.local.json"),
++  ]
++  const values = await Promise.all(files.map(readSettings))
++  if (cli) values.push(await readSettingsValue(cli))
++  return values.reduce(mergeSettings, {})
++}
++
++async function readSettings(file: string) {
++  if (!(await Bun.file(file).exists())) return {}
++  return readSettingsValue(await Bun.file(file).text())
++}
++
++async function readSettingsValue(value: string): Promise<ClaudeSettings> {
++  const source = value.trim().startsWith("{") ? value : await Bun.file(path.resolve(value)).text()
++  const errors: import("jsonc-parser").ParseError[] = []
++  const result = parse(source, errors)
++  if (errors.length || !result || typeof result !== "object" || Array.isArray(result))
++    throw new Error("Invalid Claude settings")
++  return result as ClaudeSettings
++}
++
++function mergeSettings(left: ClaudeSettings, right: ClaudeSettings): ClaudeSettings {
++  const hooks = { ...(left.hooks ?? {}) }
++  for (const [event, entries] of Object.entries(right.hooks ?? {})) {
++    hooks[event] = [...asArray(hooks[event]), ...asArray(entries)]
++  }
++  return {
++    ...left,
++    ...right,
++    worktree: { ...left.worktree, ...right.worktree },
++    hooks,
++  }
++}
++
++function hooks(settings: ClaudeSettings, event: string) {
++  const result = asArray(settings.hooks?.[event]).flatMap((group) => {
++    if (!group || typeof group !== "object" || Array.isArray(group)) return []
++    return asArray((group as Record<string, unknown>).hooks).flatMap((entry) => {
++      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return []
++      const item = entry as Record<string, unknown>
++      if (item.type !== "command") throw new Error(`Unsupported ${event} hook type: ${String(item.type)}`)
++      if (typeof item.command !== "string" || !item.command.trim()) throw new Error(`Invalid ${event} command hook`)
++      return [{ command: item.command, timeout: typeof item.timeout === "number" ? item.timeout * 1000 : 600_000 }]
++    })
++  })
++  return result.filter(
++    (item, index) =>
++      result.findIndex((other) => other.command === item.command && other.timeout === item.timeout) === index,
++  )
++}
++
++function asArray(value: unknown): unknown[] {
++  return Array.isArray(value) ? value : []
++}
++
++type Repository = { worktree: string; gitDirectory: string; commonDirectory: string }
++
++async function discover(directory: string): Promise<Repository | undefined> {
++  const root = await git(directory, ["rev-parse", "--show-toplevel"])
++  const gitDirectory = await git(directory, ["rev-parse", "--git-dir"])
++  const commonDirectory = await git(directory, ["rev-parse", "--git-common-dir"])
++  if (root.code !== 0 || gitDirectory.code !== 0 || commonDirectory.code !== 0) return undefined
++  return {
++    worktree: await canonical(path.resolve(directory, root.stdout.trim())),
++    gitDirectory: await canonical(path.resolve(directory, gitDirectory.stdout.trim())),
++    commonDirectory: await canonical(path.resolve(directory, commonDirectory.stdout.trim())),
++  }
++}
++
++async function canonicalGitMain(commonDirectory: string) {
++  const bare = await git(path.dirname(commonDirectory), ["--git-dir", commonDirectory, "config", "--get", "core.bare"])
++  if (bare.stdout.trim() === "true") return ""
++  return canonical(path.dirname(commonDirectory))
++}
++
++async function markerPath(repository: Repository) {
++  return path.join(repository.gitDirectory, "opencode-worktree.json")
++}
++
++async function assertManagedPath(projectRoot: string, root: string) {
++  await assertNoSymlink(projectRoot, root)
++  if (!contains(projectRoot, root)) throw new Error("Managed worktree path escapes the project root")
++}
++
++async function assertNoSymlink(root: string, target: string) {
++  const relative = path.relative(root, target)
++  if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Path escapes the trusted project root")
++  let current = root
++  for (const part of relative.split(path.sep).filter(Boolean)) {
++    current = path.join(current, part)
++    const info = await stat(current, true)
++    if (info?.isSymbolicLink()) throw new Error(`Refusing to traverse symlink: ${current}`)
++    if (!info) break
++  }
++}
++
++function assertSeparate(directory: string, protectedDirectories: string[]) {
++  for (const protectedDirectory of protectedDirectories) {
++    if (!protectedDirectory) continue
++    if (contains(directory, protectedDirectory)) {
++      throw new Error(`Worktree is not isolated from protected checkout: ${protectedDirectory}`)
++    }
++  }
++}
++
++function assertCustomSeparate(directory: string, protectedDirectories: string[]) {
++  for (const protectedDirectory of protectedDirectories) {
++    if (!protectedDirectory) continue
++    if (!contains(directory, protectedDirectory) && !contains(protectedDirectory, directory)) continue
++    throw new Error(`Custom worktree is not isolated from protected checkout: ${protectedDirectory}`)
++  }
++}
++
++function contains(parent: string, child: string) {
++  const relative = path.relative(normalize(parent), normalize(child))
++  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))
++}
++
++function normalize(value: string) {
++  const result = path.normalize(value)
++  return process.platform === "win32" ? result.toLowerCase() : result
++}
++
++async function same(left: string, right: string) {
++  return normalize(await canonical(left)) === normalize(await canonical(right))
++}
++
++async function canonical(value: string) {
++  const resolved = path.resolve(value)
++  const fs = await import("node:fs/promises")
++  try {
++    return await fs.realpath(resolved)
++  } catch {
++    return resolved
++  }
++}
++
++async function readMarker(file: string) {
++  if (!(await Bun.file(file).exists())) return undefined
++  try {
++    const value = await Bun.file(file).json()
++    if (
++      value?.version !== 1 ||
++      typeof value.base !== "string" ||
++      typeof value.branch !== "string" ||
++      typeof value.directory !== "string"
++    )
++      return undefined
++    return value as { version: 1; base: string; branch: string; directory: string; created: number }
++  } catch {
++    return undefined
++  }
++}
++
++async function stat(value: string, link = false) {
++  const fs = await import("node:fs/promises")
++  try {
++    return link ? await fs.lstat(value) : await fs.stat(value)
++  } catch {
++    return undefined
++  }
++}
++
++async function mkdir(directory: string) {
++  const fs = await import("node:fs/promises")
++  await fs.mkdir(directory, { recursive: true })
++}
++
++async function git(cwd: string, args: string[], signal?: AbortSignal) {
++  const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore", signal })
++  const [code, stdout, stderr] = await Promise.all([
++    proc.exited,
++    new Response(proc.stdout).text(),
++    new Response(proc.stderr).text(),
++  ])
++  return { code, stdout, stderr }
++}
++
++async function shell(
++  command: string,
++  cwd: string,
++  input: { timeout: number; stdin: string; env: Record<string, string> },
++) {
++  const controller = new AbortController()
++  const timeout = setTimeout(() => controller.abort(), input.timeout)
++  const proc = Bun.spawn(process.platform === "win32" ? ["cmd", "/c", command] : ["bash", "-lc", command], {
++    cwd,
++    env: { ...process.env, ...input.env },
++    stdin: "pipe",
++    stdout: "pipe",
++    stderr: "pipe",
++    signal: controller.signal,
++  })
++  proc.stdin.write(input.stdin)
++  proc.stdin.end()
++  try {
++    const [code, stdout, stderr] = await Promise.all([
++      proc.exited,
++      new Response(proc.stdout).text(),
++      new Response(proc.stderr).text(),
++    ])
++    return { code, stdout, stderr }
++  } finally {
++    clearTimeout(timeout)
++  }
++}
++
++function bindingFile(sessionID: string) {
++  return path.join(Global.Path.data, "worktree-session", `${sessionID}.json`)
++}
++
++async function writeBinding(binding: Binding) {
++  await Bun.write(bindingFile(binding.sessionID), JSON.stringify(binding))
++}
++
++async function readBinding(sessionID: string): Promise<Binding | undefined> {
++  const file = Bun.file(bindingFile(sessionID))
++  if (!(await file.exists())) return undefined
++  try {
++    const value = await file.json()
++    const binding = parseBinding(value)
++    return binding?.sessionID === sessionID ? binding : undefined
++  } catch {
++    return undefined
++  }
++}
++
++function parseBinding(value: unknown): Binding | undefined {
++  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
++  const item = value as Record<string, unknown>
++  if (
++    item.version !== 1 ||
++    typeof item.sessionID !== "string" ||
++    typeof item.name !== "string" ||
++    typeof item.directory !== "string" ||
++    typeof item.launchDirectory !== "string" ||
++    typeof item.projectRoot !== "string" ||
++    !Array.isArray(item.protectedDirectories) ||
++    !item.protectedDirectories.every((entry) => typeof entry === "string") ||
++    typeof item.base !== "string" ||
++    (item.provenance !== "git" && item.provenance !== "hook") ||
++    typeof item.timeCreated !== "number"
++  )
++    return undefined
++  return item as Binding
++}
++
++async function readSessionBinding(sessionID: string) {
++  const binding = await withDatabase((database) => {
++    const row = database.query("select metadata from session where id = ?").get(sessionID) as
++      | { metadata: string | null }
++      | undefined
++    if (!row?.metadata) return undefined
++    try {
++      const metadata = JSON.parse(row.metadata) as Record<string, unknown>
++      return parseBinding(metadata[MetadataKey])
++    } catch {
++      return undefined
++    }
++  })
++  if (binding) await writeBinding(binding)
++  return binding
++}
++
++async function latestBinding(launchDirectory: string) {
++  const fs = await import("node:fs/promises")
++  const root = path.join(Global.Path.data, "worktree-session")
++  const names = await fs.readdir(root).catch(() => [])
++  const values = await Promise.all(
++    names.filter((name) => name.endsWith(".json")).map((name) => readBinding(name.slice(0, -5))),
++  )
++  const candidates = values
++    .filter((item): item is Binding =>
++      Boolean(
++        item &&
++          (normalize(item.launchDirectory) === normalize(launchDirectory) ||
++            contains(item.projectRoot, launchDirectory)),
++      ),
++    )
++    .toSorted((left, right) => right.timeCreated - left.timeCreated)
++  if (!candidates.length) return undefined
++  const ids = candidates.map((item) => item.sessionID)
++  const latest = await withDatabase((database) => {
++    const placeholders = ids.map(() => "?").join(",")
++    const project = database
++      .query(`select project_id from session where id in (${placeholders}) limit 1`)
++      .get(...ids) as { project_id: string } | undefined
++    if (!project) return undefined
++    return (
++      database
++        .query(
++          "select id from session where project_id = ? and parent_id is null and time_archived is null order by time_updated desc, id desc limit 1",
++        )
++        .get(project.project_id) as { id: string } | undefined
++    )?.id
++  })
++  if (!latest) return candidates[0]
++  return candidates.find((item) => item.sessionID === latest)
++}
++
++async function latestPersistedBinding(launchDirectory: string) {
++  return withDatabase((database) => {
++    const rows = database
++      .query(
++        "select directory, metadata from session where parent_id is null and time_archived is null order by time_updated desc, id desc limit 500",
++      )
++      .all() as Array<{ directory: string; metadata: string | null }>
++    for (const row of rows) {
++      const binding = (() => {
++        if (!row.metadata) return undefined
++        try {
++          const metadata = JSON.parse(row.metadata) as Record<string, unknown>
++          return parseBinding(metadata[MetadataKey])
++        } catch {
++          return undefined
++        }
++      })()
++      if (
++        binding &&
++        (contains(binding.projectRoot, launchDirectory) || contains(launchDirectory, binding.projectRoot))
++      ) {
++        return { available: true, binding }
++      }
++      if (normalize(row.directory) === normalize(launchDirectory)) return { available: true, binding: undefined }
++    }
++    return { available: true, binding: undefined }
++  })
++}
++
++async function removeBinding(sessionID: string) {
++  const fs = await import("node:fs/promises")
++  await fs.rm(bindingFile(sessionID), { force: true })
++}
++
++function lifecycleKey(directory: string) {
++  return Bun.hash(normalize(directory)).toString(36)
++}
++
++function operationLock(directory: string) {
++  return path.join(Global.Path.state, "worktree-lock", `${lifecycleKey(directory)}.lock`)
++}
++
++function ownerRoot(directory: string) {
++  return path.join(Global.Path.state, "worktree-owner", lifecycleKey(directory))
++}
++
++async function registerOwner(binding: Binding) {
++  const release = await acquireOperationLock(binding.directory, 5000)
++  if (!release) throw new Error("Worktree lifecycle is busy in another process")
++  const file = path.join(
++    ownerRoot(binding.directory),
++    `${binding.sessionID}-${process.pid}-${crypto.randomUUID().slice(0, 8)}.json`,
++  )
++  try {
++    const fs = await import("node:fs/promises")
++    await fs.mkdir(path.dirname(file), { recursive: true })
++    await Bun.write(file, JSON.stringify({ sessionID: binding.sessionID, pid: process.pid }))
++    return file
++  } finally {
++    await release()
++  }
++}
++
++async function hasActiveOwner(binding: Binding, current: string) {
++  const fs = await import("node:fs/promises")
++  const files = await fs.readdir(ownerRoot(binding.directory)).catch(() => [])
++  for (const name of files) {
++    const file = path.join(ownerRoot(binding.directory), name)
++    if (file === current) continue
++    try {
++      const owner = (await Bun.file(file).json()) as { pid?: unknown }
++      if (typeof owner.pid !== "number") continue
++      process.kill(owner.pid, 0)
++      return true
++    } catch {
++      await fs.rm(file, { force: true })
++    }
++  }
++  return false
++}
++
++async function acquireOperationLock(directory: string, timeout = 0): Promise<(() => Promise<void>) | undefined> {
++  const fs = await import("node:fs/promises")
++  const file = operationLock(directory)
++  const deadline = Date.now() + timeout
++  await fs.mkdir(path.dirname(file), { recursive: true })
++  while (true) {
++    try {
++      await fs.mkdir(file)
++      await Bun.write(path.join(file, "owner.json"), JSON.stringify({ pid: process.pid }))
++      return () => fs.rm(file, { recursive: true, force: true })
++    } catch {
++      try {
++        const owner = (await Bun.file(path.join(file, "owner.json")).json()) as { pid?: unknown }
++        if (typeof owner.pid === "number") process.kill(owner.pid, 0)
++        if (Date.now() >= deadline) return undefined
++        await Bun.sleep(10)
++      } catch {
++        if (Date.now() < deadline) {
++          await Bun.sleep(10)
++          continue
++        }
++        await fs.rm(file, { recursive: true, force: true })
++      }
++    }
++  }
++  return undefined
++}
++
++export async function markSessionName(sessionID: string, title: string) {
++  const binding = await readBinding(sessionID)
++  if (!binding) return
++  await writeBinding({ ...binding, sessionName: title })
++}
++
++export async function adoptSessionBinding(value: unknown) {
++  const binding = parseBinding(value)
++  if (!binding) return { status: "none" as const }
++  const status = await verify(binding)
++  if (status === "gone" || status === "unsafe") {
++    await removeBinding(binding.sessionID)
++    await moveSessionRecord(binding.sessionID, binding.launchDirectory)
++  }
++  if (status !== "valid") return { status, binding }
++  const ownerFile = await registerOwner(binding)
++  return {
++    status,
++    binding,
++    release: async () => {
++      const fs = await import("node:fs/promises")
++      await fs.rm(ownerFile, { force: true })
++    },
++  }
++}
++
++async function moveSessionRecord(sessionID: string, directory: string) {
++  await withDatabase((database) => {
++    database.query("update session set directory = ?, path = null where id = ?").run(directory, sessionID)
++  }, false)
++}
++
++async function withDatabase<A>(
++  fn: (database: import("bun:sqlite").Database) => A,
++  readonly = true,
++): Promise<A | undefined> {
++  try {
++    const module = await import("@opencode-ai/core/database/database")
++    const filename = module.Database.path()
++    if (filename === ":memory:") return undefined
++    const sqlite = await import("bun:sqlite")
++    const database = new sqlite.Database(filename, { readonly })
++    try {
++      return fn(database)
++    } finally {
++      database.close()
++    }
++  } catch {
++    return undefined
++  }
++}
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts
+index 662585020a..45b16b130a 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts
+@@ -83,7 +83,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session",
+     })
+ 
+     const get = Effect.fn("SessionHttpApi.get")(function* (ctx: { params: { sessionID: SessionID } }) {
+-      return yield* requireSession(ctx.params.sessionID)
++      const info = yield* requireSession(ctx.params.sessionID)
++      const directory = yield* InstanceState.directory
++      return directory === info.directory || !info.metadata?.["opencode.worktree"] ? info : { ...info, directory }
+     })
+ 
+     const children = Effect.fn("SessionHttpApi.children")(function* (ctx: { params: { sessionID: SessionID } }) {
+@@ -185,8 +187,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session",
+       payload: typeof UpdatePayload.Type
+     }) {
+       const current = yield* requireSession(ctx.params.sessionID)
+-      if (ctx.payload.title !== undefined) {
+-        yield* session.setTitle({ sessionID: ctx.params.sessionID, title: ctx.payload.title })
++      const title = ctx.payload.title
++      if (title !== undefined) {
++        yield* session.setTitle({ sessionID: ctx.params.sessionID, title })
++        if (current.metadata?.["opencode.worktree"]) {
++          const { markSessionName } = yield* Effect.promise(() => import("@/cli/worktree"))
++          yield* Effect.promise(() => markSessionName(ctx.params.sessionID, title))
++        }
+       }
+       if (ctx.payload.metadata !== undefined) {
+         yield* session.setMetadata({ sessionID: ctx.params.sessionID, metadata: ctx.payload.metadata })
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts b/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
+index 873abd8349..89593d4cd7 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/middleware/workspace-routing.ts
+@@ -219,9 +219,10 @@ function routeHttpApiWorkspace<E>(
+ > {
+   return Effect.gen(function* () {
+     const request = yield* HttpServerRequest.HttpServerRequest
++    const sessionSvc = yield* Session.Service
+     const sessionID = getWorkspaceRouteSessionID(requestURL(request))
+     const session = sessionID
+-      ? yield* Session.Service.use((svc) => svc.get(sessionID)).pipe(
++      ? yield* sessionSvc.get(sessionID).pipe(
+           Effect.catchIf(
+             (error): error is NotFoundError => NotFoundError.isInstance(error),
+             () => Effect.succeed(undefined),
+@@ -229,8 +230,28 @@ function routeHttpApiWorkspace<E>(
+           Effect.catchDefect(() => Effect.succeed(undefined)),
+         )
+       : undefined
+-    const plan = yield* planRequest(request, session)
+-    return yield* routeWorkspace(client, effect, plan)
++    const adoption = session
++      ? yield* Effect.gen(function* () {
++          const binding = session.metadata?.["opencode.worktree"]
++          if (!binding) return { session }
++          const { adoptSessionBinding } = yield* Effect.promise(() => import("@/cli/worktree"))
++          const result = yield* Effect.promise(() => adoptSessionBinding(binding))
++          if (result.status === "valid") return { session, release: result.release }
++          yield* Effect.logWarning("worktree session could not be adopted", { sessionID, status: result.status })
++          const metadata = { ...session.metadata }
++          delete metadata["opencode.worktree"]
++          const fallback = result.binding?.launchDirectory ?? defaultDirectory(request, requestURL(request))
++          if (result.status === "gone" || result.status === "unsafe") {
++            yield* sessionSvc.clearWorktree({ sessionID: session.id, directory: fallback })
++          }
++          return { session: { ...session, directory: fallback, metadata } }
++        })
++      : { session: undefined, release: undefined }
++    const plan = yield* planRequest(request, adoption.session)
++    const routed = routeWorkspace(client, effect, plan)
++    return yield* adoption.release
++      ? routed.pipe(Effect.ensuring(Effect.promise(adoption.release).pipe(Effect.ignore)))
++      : routed
+   })
+ }
+ 
+diff --git a/packages/opencode/src/session/session.ts b/packages/opencode/src/session/session.ts
+index a2a91cd47b..63016b4fdd 100644
+--- a/packages/opencode/src/session/session.ts
++++ b/packages/opencode/src/session/session.ts
+@@ -259,6 +259,7 @@ export type GlobalInfo = Types.DeepMutable<Schema.Schema.Type<typeof GlobalInfo>
+ 
+ export const CreateInput = Schema.optional(
+   Schema.Struct({
++    id: Schema.optional(SessionID),
+     parentID: Schema.optional(SessionID),
+     title: Schema.optional(Schema.String),
+     agent: Schema.optional(Schema.String),
+@@ -414,6 +415,7 @@ export interface Interface {
+   readonly list: (input?: ListInput) => Effect.Effect<Info[]>
+   readonly listGlobal: (input?: GlobalListInput) => Effect.Effect<GlobalInfo[]>
+   readonly create: (input?: {
++    id?: SessionID
+     parentID?: SessionID
+     title?: string
+     agent?: string
+@@ -428,6 +430,7 @@ export interface Interface {
+   readonly setTitle: (input: { sessionID: SessionID; title: string }) => Effect.Effect<void>
+   readonly setArchived: (input: { sessionID: SessionID; time?: number }) => Effect.Effect<void>
+   readonly setMetadata: (input: typeof SetMetadataInput.Type) => Effect.Effect<void>
++  readonly clearWorktree: (input: { sessionID: SessionID; directory: string }) => Effect.Effect<void>
+   readonly setAgentModel: (input: {
+     sessionID: SessionID
+     agent: string
+@@ -665,6 +668,7 @@ const layer: Layer.Layer<
+     })
+ 
+     const create = Effect.fn("Session.create")(function* (input?: {
++      id?: SessionID
+       parentID?: SessionID
+       title?: string
+       agent?: string
+@@ -676,6 +680,7 @@ const layer: Layer.Layer<
+       const ctx = yield* InstanceState.context
+       const workspace = yield* InstanceState.workspaceID
+       return yield* createNext({
++        id: input?.id,
+         parentID: input?.parentID,
+         directory: ctx.directory,
+         path: sessionPath(ctx.worktree, ctx.directory),
+@@ -692,12 +697,14 @@ const layer: Layer.Layer<
+       const ctx = yield* InstanceState.context
+       const original = yield* get(input.sessionID)
+       const title = getForkedTitle(original.title)
++      const metadata = structuredClone(original.metadata)
++      if (metadata) delete metadata["opencode.worktree"]
+       const session = yield* createNext({
+         directory: ctx.directory,
+         path: sessionPath(ctx.worktree, ctx.directory),
+         workspaceID: original.workspaceID,
+         title,
+-        metadata: structuredClone(original.metadata),
++        metadata,
+       })
+       const msgs = yield* messages({ sessionID: input.sessionID })
+       const idMap = new Map<string, MessageID>()
+@@ -762,6 +769,32 @@ const layer: Layer.Layer<
+       yield* patch(input.sessionID, { metadata: input.metadata, time: { updated: Date.now() } }).pipe(Effect.orDie)
+     })
+ 
++    const clearWorktree = Effect.fn("Session.clearWorktree")(function* (input: {
++      sessionID: SessionID
++      directory: string
++    }) {
++      const current = yield* db
++        .select({ metadata: SessionTable.metadata })
++        .from(SessionTable)
++        .where(eq(SessionTable.id, input.sessionID))
++        .get()
++        .pipe(Effect.orDie)
++      if (!current) return yield* Effect.die(new Error(`Session not found: ${input.sessionID}`))
++      const metadata = { ...current.metadata }
++      delete metadata["opencode.worktree"]
++      yield* db
++        .update(SessionTable)
++        .set({
++          directory: input.directory,
++          path: null,
++          metadata,
++          time_updated: Date.now(),
++        })
++        .where(eq(SessionTable.id, input.sessionID))
++        .run()
++        .pipe(Effect.orDie)
++    })
++
+     const setAgentModel = Effect.fn("Session.setAgentModel")(function* (input: {
+       sessionID: SessionID
+       agent: string
+@@ -913,6 +946,7 @@ const layer: Layer.Layer<
+       setTitle,
+       setArchived,
+       setMetadata,
++      clearWorktree,
+       setAgentModel,
+       setPermission,
+       setRevert,
+diff --git a/packages/opencode/src/session/tools.ts b/packages/opencode/src/session/tools.ts
+index 99f7aec4fd..59b778c11b 100644
+--- a/packages/opencode/src/session/tools.ts
++++ b/packages/opencode/src/session/tools.ts
+@@ -61,7 +61,15 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
+     abort: options.abortSignal!,
+     messageID: input.processor.message.id,
+     callID: options.toolCallId,
+-    extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps: input.promptOps },
++    extra: {
++      model: input.model,
++      bypassAgentCheck: input.bypassAgentCheck,
++      promptOps: input.promptOps,
++      worktree:
++        process.env.OPENCODE_WORKTREE_DISABLED_SESSION === input.session.id
++          ? undefined
++          : input.session.metadata?.["opencode.worktree"],
++    },
+     agent: input.agent.name,
+     messages: input.messages,
+     metadata: (val) =>
+diff --git a/packages/opencode/src/tool/apply_patch.ts b/packages/opencode/src/tool/apply_patch.ts
+index 3f89a63974..8aba6a4178 100644
+--- a/packages/opencode/src/tool/apply_patch.ts
++++ b/packages/opencode/src/tool/apply_patch.ts
+@@ -14,6 +14,7 @@ import DESCRIPTION from "./apply_patch.txt"
+ import { FileSystem } from "@opencode-ai/core/filesystem"
+ import { Format } from "../format"
+ import * as Bom from "@/util/bom"
++import { assertPath as assertWorktreePath } from "./worktree-isolation"
+ 
+ export const Parameters = Schema.Struct({
+   patchText: Schema.String.annotate({ description: "The full patch text that describes all changes to be made" }),
+@@ -71,6 +72,7 @@ export const ApplyPatchTool = Tool.define(
+ 
+       for (const hunk of hunks) {
+         const filePath = path.resolve(instance.directory, hunk.path)
++        yield* assertWorktreePath(ctx, filePath)
+         yield* assertExternalDirectoryEffect(ctx, filePath)
+ 
+         switch (hunk.type) {
+@@ -140,6 +142,7 @@ export const ApplyPatchTool = Tool.define(
+             }
+ 
+             const movePath = hunk.move_path ? path.resolve(instance.directory, hunk.move_path) : undefined
++            yield* assertWorktreePath(ctx, movePath)
+             yield* assertExternalDirectoryEffect(ctx, movePath)
+ 
+             fileChanges.push({
+diff --git a/packages/opencode/src/tool/edit.ts b/packages/opencode/src/tool/edit.ts
+index a92e4720c0..23c7d50470 100644
+--- a/packages/opencode/src/tool/edit.ts
++++ b/packages/opencode/src/tool/edit.ts
+@@ -18,6 +18,7 @@ import { Snapshot } from "@/snapshot"
+ import { assertExternalDirectoryEffect } from "./external-directory"
+ import { FSUtil } from "@opencode-ai/core/fs-util"
+ import * as Bom from "@/util/bom"
++import { assertPath as assertWorktreePath } from "./worktree-isolation"
+ 
+ function normalizeLineEndings(text: string): string {
+   return text.replaceAll("\r\n", "\n")
+@@ -80,6 +81,7 @@ export const EditTool = Tool.define(
+           const filePath = path.isAbsolute(params.filePath)
+             ? params.filePath
+             : path.join(instance.directory, params.filePath)
++          yield* assertWorktreePath(ctx, filePath)
+           yield* assertExternalDirectoryEffect(ctx, filePath)
+ 
+           let diff = ""
+diff --git a/packages/opencode/src/tool/shell.ts b/packages/opencode/src/tool/shell.ts
+index 1e4423e017..73655c11b7 100644
+--- a/packages/opencode/src/tool/shell.ts
++++ b/packages/opencode/src/tool/shell.ts
+@@ -21,6 +21,11 @@ import { ChildProcess } from "effect/unstable/process"
+ import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
+ import { ShellPrompt, type Parameters } from "./shell/prompt"
+ import { BashArity } from "@/permission/arity"
++import {
++  active as worktreeIsolationActive,
++  assertCommand as assertWorktreeCommand,
++  assertPaths as assertWorktreePaths,
++} from "./worktree-isolation"
+ 
+ export { Parameters } from "./shell/prompt"
+ 
+@@ -64,6 +69,109 @@ const CMD_FILES = new Set([
+ ])
+ const FLAGS = new Set(["-destination", "-literalpath", "-path"])
+ const SWITCHES = new Set(["-confirm", "-debug", "-force", "-nonewline", "-recurse", "-verbose", "-whatif"])
++const DYNAMIC_EXECUTABLES = new Set([
++  "bash",
++  "bun",
++  "bunx",
++  "cmd",
++  "deno",
++  "eval",
++  "node",
++  "npx",
++  "perl",
++  "php",
++  "powershell",
++  "pwsh",
++  "python",
++  "python3",
++  "ruby",
++  "sh",
++  "source",
++  "xargs",
++  "zsh",
++])
++const SAFE_WORKTREE_EXECUTABLES = new Set([
++  "[",
++  "cat",
++  "cd",
++  "chdir",
++  "chmod",
++  "chown",
++  "cp",
++  "cut",
++  "diff",
++  "dir",
++  "echo",
++  "false",
++  "git",
++  "grep",
++  "ls",
++  "mkdir",
++  "mv",
++  "popd",
++  "printf",
++  "pushd",
++  "pwd",
++  "rm",
++  "rmdir",
++  "set-location",
++  "sort",
++  "test",
++  "touch",
++  "tr",
++  "true",
++  "type",
++  "uniq",
++  "wc",
++  "which",
++])
++const GIT_BUILTINS = new Set([
++  "add",
++  "annotate",
++  "apply",
++  "bisect",
++  "blame",
++  "branch",
++  "checkout",
++  "cherry",
++  "cherry-pick",
++  "clean",
++  "clone",
++  "commit",
++  "config",
++  "describe",
++  "diff",
++  "diff-tree",
++  "fetch",
++  "for-each-ref",
++  "format-patch",
++  "grep",
++  "init",
++  "log",
++  "ls-files",
++  "ls-tree",
++  "merge",
++  "merge-base",
++  "mv",
++  "pull",
++  "push",
++  "rebase",
++  "reflog",
++  "remote",
++  "reset",
++  "restore",
++  "rev-list",
++  "rev-parse",
++  "rm",
++  "show",
++  "show-ref",
++  "stash",
++  "status",
++  "switch",
++  "symbolic-ref",
++  "tag",
++  "worktree",
++])
+ 
+ type Part = {
+   type: string
+@@ -72,8 +180,11 @@ type Part = {
+ 
+ type Scan = {
+   dirs: Set<string>
++  paths: Set<string>
+   patterns: Set<string>
+   always: Set<string>
++  unsafeGitRedirect: boolean
++  ambiguous: boolean
+ }
+ 
+ type Chunk = {
+@@ -185,6 +296,29 @@ function prefix(text: string) {
+   return text.slice(0, match.index)
+ }
+ 
++function likelyPath(text: string) {
++  const value = unquote(text)
++  return (
++    value.startsWith(".") ||
++    value.startsWith("~") ||
++    value.startsWith("/") ||
++    value.startsWith("\\") ||
++    /^[A-Za-z]:[\\/]/.test(value) ||
++    value.includes("/") ||
++    value.includes("\\")
++  )
++}
++
++function obfuscatedPath(text: string, type?: string) {
++  const value = unquote(text)
++  return (
++    type === "concatenation" ||
++    value.includes('"') ||
++    value.includes("'") ||
++    (process.platform !== "win32" && value.includes("\\"))
++  )
++}
++
+ function pathArgs(list: Part[], ps: boolean, cmd = false) {
+   if (!ps) {
+     return list
+@@ -384,8 +518,11 @@ export const ShellTool = Tool.define(
+     ) {
+       const scan: Scan = {
+         dirs: new Set<string>(),
++        paths: new Set<string>(),
+         patterns: new Set<string>(),
+         always: new Set<string>(),
++        unsafeGitRedirect: false,
++        ambiguous: false,
+       }
+       const shellKind = ShellID.toKind(Shell.name(shell))
+ 
+@@ -393,11 +530,90 @@ export const ShellTool = Tool.define(
+         const command = parts(node)
+         const tokens = command.map((item) => item.text)
+         const cmd = ps || shellKind === "cmd" ? tokens[0]?.toLowerCase() : tokens[0]
++        const executable = cmd
++          ? path
++              .basename(unquote(cmd))
++              .toLowerCase()
++              .replace(/\.exe$/, "")
++          : undefined
++        if (executable && DYNAMIC_EXECUTABLES.has(executable)) scan.ambiguous = true
++        if (executable && !SAFE_WORKTREE_EXECUTABLES.has(executable)) scan.ambiguous = true
++        if (
++          command.slice(1).some((item) =>
++            DYNAMIC_EXECUTABLES.has(
++              path
++                .basename(unquote(item.text))
++                .toLowerCase()
++                .replace(/\.exe$/, ""),
++            ),
++          )
++        )
++          scan.ambiguous = true
++        if (node.text.includes("$(") || node.text.includes("`")) scan.ambiguous = true
++
++        for (const item of command.slice(1).filter((item) => likelyPath(item.text))) {
++          if (obfuscatedPath(item.text, item.type)) scan.ambiguous = true
++          const resolved = yield* argPath(item.text, cwd, ps, shell)
++          if (resolved) scan.paths.add(resolved)
++          else scan.ambiguous = true
++        }
++
++        for (const match of source(node).matchAll(/(?:^|\s)(?:>|>>|<)\s*([^\s;&|]+)/g)) {
++          if (obfuscatedPath(match[1])) scan.ambiguous = true
++          const resolved = yield* argPath(match[1], cwd, ps, shell)
++          if (resolved) scan.paths.add(resolved)
++          else scan.ambiguous = true
++        }
++
++        const gitIndex = command.findIndex(
++          (item) =>
++            path
++              .basename(unquote(item.text))
++              .toLowerCase()
++              .replace(/\.exe$/, "") === "git",
++        )
++        if (gitIndex >= 0) {
++          let subcommand: string | undefined
++          for (let index = gitIndex + 1; index < command.length; index++) {
++            const token = command[index]?.text ?? ""
++            const previous = command[index - 1]?.text
++            if (
++              ["-c", "--config-env", "--exec-path"].includes(token) ||
++              token.startsWith("--config-env=") ||
++              token.startsWith("--exec-path=")
++            ) {
++              scan.ambiguous = true
++            }
++            const inline = token.match(/^(?:-C|--git-dir|--work-tree)=(.+)$/)
++            if (!inline && previous !== "-C" && previous !== "--git-dir" && previous !== "--work-tree") continue
++            const value = inline?.[1] ?? token
++            const resolved = yield* argPath(value, cwd, ps, shell)
++            if (!resolved) {
++              scan.unsafeGitRedirect = true
++              continue
++            }
++            scan.paths.add(resolved)
++          }
++          const takesValue = new Set(["-C", "-c", "--config-env", "--git-dir", "--work-tree"])
++          for (let index = gitIndex + 1; index < command.length; index++) {
++            const token = unquote(command[index]?.text ?? "")
++            if (takesValue.has(token)) {
++              index++
++              continue
++            }
++            if (token.startsWith("-")) continue
++            subcommand = token.toLowerCase()
++            break
++          }
++          if (subcommand && !GIT_BUILTINS.has(subcommand)) scan.ambiguous = true
++        }
++        if (/\bGIT_[A-Z0-9_]+\s*=/i.test(source(node))) scan.unsafeGitRedirect = true
+ 
+         if (cmd && (FILES.has(cmd) || (shellKind === "cmd" && CMD_FILES.has(cmd)))) {
+           for (const arg of pathArgs(command, ps, shellKind === "cmd")) {
+             const resolved = yield* argPath(arg, cwd, ps, shell)
+             yield* Effect.logInfo("resolved path", { arg, resolved })
++            if (resolved) scan.paths.add(resolved)
+             if (!resolved || containsPath(resolved, instance)) continue
+             const dir = (yield* fs.isDir(resolved)) ? resolved : path.dirname(resolved)
+             scan.dirs.add(dir)
+@@ -623,6 +839,11 @@ export const ShellTool = Tool.define(
+                     Effect.sync(() => tree.delete()),
+                   )
+                   const scan = yield* collect(tree.rootNode, cwd, ps, shell, instanceCtx)
++                  yield* assertWorktreeCommand(ctx, params.command)
++                  if (worktreeIsolationActive(ctx) && (scan.unsafeGitRedirect || scan.ambiguous)) {
++                    throw new Error("Worktree isolation could not safely determine the shell command's path targets")
++                  }
++                  yield* assertWorktreePaths(ctx, [cwd, ...scan.paths])
+                   if (!containsPath(cwd, instanceCtx)) scan.dirs.add(cwd)
+                   yield* ask(ctx, scan, params)
+                 }),
+diff --git a/packages/opencode/src/tool/task.ts b/packages/opencode/src/tool/task.ts
+index d8ca640cfb..d9b30a2296 100644
+--- a/packages/opencode/src/tool/task.ts
++++ b/packages/opencode/src/tool/task.ts
+@@ -159,6 +159,9 @@ export const TaskTool = Tool.define(
+           parentID: ctx.sessionID,
+           title: params.description + ` (@${next.name} subagent)`,
+           agent: next.name,
++          metadata: parent.metadata?.["opencode.worktree"]
++            ? { "opencode.worktree": parent.metadata["opencode.worktree"] }
++            : undefined,
+           permission: [
+             ...childPermission,
+             ...childToolDenies.filter(
+diff --git a/packages/opencode/src/tool/worktree-isolation.ts b/packages/opencode/src/tool/worktree-isolation.ts
+new file mode 100644
+index 0000000000..875d5fe262
+--- /dev/null
++++ b/packages/opencode/src/tool/worktree-isolation.ts
+@@ -0,0 +1,94 @@
++import type { Context } from "./tool"
++import path from "node:path"
++import { Effect } from "effect"
++
++type Binding = {
++  directory: string
++  protectedDirectories: string[]
++}
++
++export function active(ctx: Context) {
++  return parse(ctx.extra?.worktree) !== undefined
++}
++
++export const assertCommand = Effect.fnUntraced(function* (ctx: Context, command: string) {
++  const binding = parse(ctx.extra?.worktree)
++  if (!binding) return
++  const withoutWorktree = command
++    .replaceAll(binding.directory, "")
++    .replaceAll(binding.directory.replaceAll("\\", "/"), "")
++  for (const protectedDirectory of binding.protectedDirectories) {
++    if (
++      !withoutWorktree.includes(protectedDirectory) &&
++      !withoutWorktree.includes(protectedDirectory.replaceAll("\\", "/"))
++    )
++      continue
++    throw new Error(
++      `Worktree isolation prevents shell access to the protected checkout at ${protectedDirectory}. Use the active worktree at ${binding.directory}.`,
++    )
++  }
++})
++
++export const assertPath = Effect.fnUntraced(function* (ctx: Context, target: string | undefined) {
++  if (!target) return
++  const binding = parse(ctx.extra?.worktree)
++  if (!binding) return
++
++  const lexical = normalize(path.resolve(target))
++  const real = yield* Effect.promise(() => canonical(lexical))
++  if (contains(binding.directory, lexical) && contains(binding.directory, real)) return
++  for (const protectedDirectory of binding.protectedDirectories) {
++    if (!contains(protectedDirectory, lexical) && !contains(protectedDirectory, real)) continue
++    throw new Error(
++      `Worktree isolation prevents access to the protected checkout at ${protectedDirectory}. Use the active worktree at ${binding.directory}.`,
++    )
++  }
++})
++
++export const assertPaths = Effect.fnUntraced(function* (ctx: Context, targets: Iterable<string | undefined>) {
++  for (const target of targets) yield* assertPath(ctx, target)
++})
++
++function parse(value: unknown): Binding | undefined {
++  if (!value || typeof value !== "object" || Array.isArray(value)) return
++  const item = value as Record<string, unknown>
++  if (typeof item.directory !== "string" || !Array.isArray(item.protectedDirectories)) return
++  if (!item.protectedDirectories.every((entry) => typeof entry === "string")) return
++  return { directory: item.directory, protectedDirectories: item.protectedDirectories as string[] }
++}
++
++function contains(parent: string, child: string) {
++  const relative = path.relative(normalize(parent), normalize(child))
++  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))
++}
++
++function normalize(value: string) {
++  const result = path.normalize(value)
++  return process.platform === "win32" ? result.toLowerCase() : result
++}
++
++async function canonical(value: string, depth = 0): Promise<string> {
++  if (depth > 40) throw new Error("Too many symbolic links while checking worktree isolation")
++  const fs = await import("node:fs/promises")
++  const absolute = path.resolve(value)
++  const root = path.parse(absolute).root
++  const parts = absolute.slice(root.length).split(path.sep).filter(Boolean)
++  let current = root
++  for (let index = 0; index < parts.length; index++) {
++    const candidate = path.join(current, parts[index])
++    const info = await fs.lstat(candidate).catch(() => undefined)
++    if (!info) {
++      current = candidate
++      continue
++    }
++    if (!info.isSymbolicLink()) {
++      current = candidate
++      continue
++    }
++    return canonical(
++      path.resolve(path.dirname(candidate), await fs.readlink(candidate), ...parts.slice(index + 1)),
++      depth + 1,
++    )
++  }
++  return current
++}
+diff --git a/packages/opencode/src/tool/write.ts b/packages/opencode/src/tool/write.ts
+index 37be6d8c47..d099e4f66b 100644
+--- a/packages/opencode/src/tool/write.ts
++++ b/packages/opencode/src/tool/write.ts
+@@ -14,6 +14,7 @@ import { InstanceState } from "@/effect/instance-state"
+ import { trimDiff } from "./edit"
+ import { assertExternalDirectoryEffect } from "./external-directory"
+ import * as Bom from "@/util/bom"
++import { assertPath as assertWorktreePath } from "./worktree-isolation"
+ 
+ const MAX_PROJECT_DIAGNOSTICS_FILES = 5
+ 
+@@ -41,6 +42,7 @@ export const WriteTool = Tool.define(
+           const filepath = path.isAbsolute(params.filePath)
+             ? params.filePath
+             : path.join(instance.directory, params.filePath)
++          yield* assertWorktreePath(ctx, filepath)
+           yield* assertExternalDirectoryEffect(ctx, filepath)
+ 
+           const exists = yield* fs.existsSafe(filepath)
+diff --git a/packages/opencode/test/cli/help/__snapshots__/help-snapshots.test.ts.snap b/packages/opencode/test/cli/help/__snapshots__/help-snapshots.test.ts.snap
+index e9d3ad2338..98f1b4e1ec 100644
+--- a/packages/opencode/test/cli/help/__snapshots__/help-snapshots.test.ts.snap
++++ b/packages/opencode/test/cli/help/__snapshots__/help-snapshots.test.ts.snap
+@@ -82,6 +82,10 @@ Options:
+       --log-level    log level                  [string] [choices: "DEBUG", "INFO", "WARN", "ERROR"]
+       --pure         run without external plugins                                          [boolean]
+       --command      the command to run, use message for args                               [string]
++      --prompt       message to send when using an option with an optional value            [string]
++  -w, --worktree     start the session in a new or existing worktree                        [string]
++  -n, --name         name for the session                                                   [string]
++      --settings     Claude settings JSON or path used for worktree hooks                   [string]
+   -c, --continue     continue the last session                                             [boolean]
+   -s, --session      session id to continue                                                 [string]
+       --fork         fork the session before continuing (requires --continue or --session) [boolean]
+diff --git a/packages/opencode/test/cli/tui/thread.test.ts b/packages/opencode/test/cli/tui/thread.test.ts
+index 2b29698086..2407efc68c 100644
+--- a/packages/opencode/test/cli/tui/thread.test.ts
++++ b/packages/opencode/test/cli/tui/thread.test.ts
+@@ -72,6 +72,22 @@ describe("tui thread", () => {
+     expect(args.mdns).toBe(false)
+   })
+ 
++  test("parses worktree names independently from the project positional", async () => {
++    const named = await yargs([])
++      .command({ ...TuiThreadCommand, handler: () => {} })
++      .exitProcess(false)
++      .parse(["-w", "feature-auth", "."])
++    expect(named.worktree).toBe("feature-auth")
++    expect(named.project).toBe(".")
++
++    const generated = await yargs([])
++      .command({ ...TuiThreadCommand, handler: () => {} })
++      .exitProcess(false)
++      .parse(["-w", "--prompt", "hello"])
++    expect(generated.worktree).toBe("")
++    expect(generated.prompt).toBe("hello")
++  })
++
+   cliIt.live("rejects mini-only options without --mini", ({ opencode }) =>
+     Effect.gen(function* () {
+       const result = yield* opencode.spawn(["--replay-limit", "10"])
+diff --git a/packages/opencode/test/cli/worktree.test.ts b/packages/opencode/test/cli/worktree.test.ts
+new file mode 100644
+index 0000000000..e1cc9966b1
+--- /dev/null
++++ b/packages/opencode/test/cli/worktree.test.ts
+@@ -0,0 +1,457 @@
++import { $ } from "bun"
++import { describe, expect, test } from "bun:test"
++import { Effect } from "effect"
++import path from "node:path"
++import { cliIt, testModelID } from "../lib/cli-process"
++import { reply } from "../lib/llm-server"
++import { tmpdir } from "../fixture/fixture"
++import { adoptSessionBinding, type Binding } from "@/cli/worktree"
++
++async function git(directory: string, ...args: string[]) {
++  await $`git ${args}`.cwd(directory).quiet()
++}
++
++async function initialise(directory: string) {
++  await git(directory, "init")
++  await git(directory, "config", "core.fsmonitor", "false")
++  await git(directory, "config", "commit.gpgsign", "false")
++  await git(directory, "config", "user.email", "test@opencode.test")
++  await git(directory, "config", "user.name", "Test")
++  await git(directory, "commit", "--allow-empty", "-m", "root")
++}
++
++describe("worktree CLI", () => {
++  test("serializes concurrent server ownership registration", async () => {
++    await using directory = await tmpdir()
++    await using protectedDirectory = await tmpdir()
++    const binding: Binding = {
++      version: 1,
++      sessionID: "ses_concurrent-adoption",
++      name: "concurrent-adoption",
++      directory: directory.path,
++      launchDirectory: protectedDirectory.path,
++      projectRoot: protectedDirectory.path,
++      protectedDirectories: [protectedDirectory.path],
++      base: "hook",
++      provenance: "hook",
++      timeCreated: Date.now(),
++    }
++
++    const results = await Promise.all(Array.from({ length: 4 }, () => adoptSessionBinding(binding)))
++    expect(results.every((result) => result.status === "valid")).toBe(true)
++    await Promise.all(results.flatMap((result) => (result.status === "valid" ? [result.release()] : [])))
++  })
++
++  cliIt.live(
++    "creates and retains a named Git worktree before a non-interactive prompt",
++    ({ home, llm, opencode }) =>
++      Effect.gen(function* () {
++        yield* Effect.promise(() => initialise(home))
++        yield* llm.text("created in worktree")
++
++        const result = yield* opencode.spawn([
++          "run",
++          "--model",
++          testModelID,
++          "--worktree",
++          "feature-auth",
++          "--prompt",
++          "say where you are",
++        ])
++
++        opencode.expectExit(result, 0)
++        expect(result.stdout).toBe("created in worktree\n")
++        const directory = path.join(home, ".claude", "worktrees", "feature-auth")
++        expect(yield* Effect.promise(() => Bun.file(path.join(directory, ".git")).exists())).toBe(true)
++        expect(yield* Effect.promise(() => $`git branch --show-current`.cwd(directory).quiet().text())).toBe(
++          "worktree-feature-auth\n",
++        )
++      }),
++    60_000,
++  )
++
++  cliIt.live(
++    "copies matching ignored files through .worktreeinclude",
++    ({ home, llm, opencode }) =>
++      Effect.gen(function* () {
++        yield* Effect.promise(async () => {
++          await initialise(home)
++          await Bun.write(path.join(home, ".gitignore"), ".env\n.claude/worktrees/\n")
++          await Bun.write(path.join(home, ".worktreeinclude"), ".env\n")
++          await Bun.write(path.join(home, ".env"), "WORKTREE_SECRET=test\n")
++          await git(home, "add", ".gitignore", ".worktreeinclude")
++          await git(home, "commit", "-m", "worktree setup")
++        })
++        yield* llm.text("copied")
++
++        const result = yield* opencode.spawn([
++          "run",
++          "--model",
++          testModelID,
++          "-w",
++          "include-test",
++          "--prompt",
++          "check setup",
++        ])
++
++        opencode.expectExit(result, 0)
++        expect(
++          yield* Effect.promise(() => Bun.file(path.join(home, ".claude", "worktrees", "include-test", ".env")).text()),
++        ).toBe("WORKTREE_SECRET=test\n")
++      }),
++    60_000,
++  )
++
++  cliIt.live(
++    "uses a WorktreeCreate hook outside Git and reserves its session ID",
++    ({ home, llm, opencode }) =>
++      Effect.gen(function* () {
++        const script = path.join(home, "create-worktree.ts")
++        const directory = path.join(path.dirname(home), `${path.basename(home)}-custom-worktree`)
++        const captured = path.join(home, "hook-input.json")
++        yield* Effect.addFinalizer(() =>
++          Effect.promise(async () => {
++            const fs = await import("node:fs/promises")
++            await fs.rm(directory, { recursive: true, force: true })
++          }).pipe(Effect.ignore),
++        )
++        yield* Effect.promise(async () => {
++          await Bun.write(
++            script,
++            [
++              'import fs from "node:fs/promises"',
++              `const input = await Bun.stdin.text()`,
++              `await fs.mkdir(${JSON.stringify(directory)}, { recursive: true })`,
++              `await Bun.write(${JSON.stringify(captured)}, input)`,
++              `console.log(${JSON.stringify(directory)})`,
++            ].join("\n"),
++          )
++          await Bun.write(
++            path.join(home, ".claude", "settings.local.json"),
++            JSON.stringify({
++              hooks: {
++                WorktreeCreate: [{ hooks: [{ type: "command", command: `bun ${JSON.stringify(script)}` }] }],
++              },
++            }),
++          )
++        })
++        yield* llm.text("hooked")
++
++        const result = yield* opencode.spawn([
++          "run",
++          "--model",
++          testModelID,
++          "-w",
++          "custom-name",
++          "--dangerously-skip-permissions",
++          "--prompt",
++          "run hook",
++        ])
++
++        opencode.expectExit(result, 0)
++        const input = yield* Effect.promise(() => Bun.file(captured).json())
++        const fs = yield* Effect.promise(() => import("node:fs/promises"))
++        expect(input).toMatchObject({
++          hook_event_name: "WorktreeCreate",
++          cwd: yield* Effect.promise(() => fs.realpath(home)),
++          name: "custom-name",
++        })
++        const records = yield* Effect.promise(async () => {
++          const root = path.join(home, ".local", "share", "opencode", "worktree-session")
++          return Promise.all((await fs.readdir(root)).map((name) => Bun.file(path.join(root, name)).json()))
++        })
++        expect(records).toContainEqual(
++          expect.objectContaining({
++            sessionID: input.session_id,
++            directory: yield* Effect.promise(() => fs.realpath(directory)),
++          }),
++        )
++      }),
++    60_000,
++  )
++
++  cliIt.live(
++    "resumes a retained session inside its worktree without passing -w again",
++    ({ home, llm, opencode }) =>
++      Effect.gen(function* () {
++        yield* Effect.promise(() => initialise(home))
++        yield* llm.text("first run")
++        const first = yield* opencode.spawn(
++          ["run", "--model", testModelID, "--format", "json", "-w", "resume-test", "--prompt", "start"],
++          { env: { OPENCODE_DB: "opencode.db" } },
++        )
++        opencode.expectExit(first, 0)
++        const sessionID = opencode.parseJsonEvents(first.stdout)[0]?.sessionID
++        expect(typeof sessionID).toBe("string")
++        expect(
++          yield* Effect.promise(() =>
++            Bun.file(
++              path.join(home, ".local", "share", "opencode", "worktree-session", `${String(sessionID)}.json`),
++            ).exists(),
++          ),
++        ).toBe(true)
++        yield* Effect.promise(async () => {
++          const fs = await import("node:fs/promises")
++          await fs.rm(path.join(home, ".local", "share", "opencode", "worktree-session", `${String(sessionID)}.json`))
++        })
++
++        yield* llm.push(
++          reply().tool("bash", {
++            command: "pwd > resumed.txt",
++            description: "Record the current directory",
++          }),
++        )
++        yield* llm.text("resumed")
++        const resumed = yield* opencode.spawn(
++          ["run", "--model", testModelID, "--session", String(sessionID), "--dangerously-skip-permissions", "continue"],
++          { env: { OPENCODE_DB: "opencode.db" } },
++        )
++
++        opencode.expectExit(resumed, 0)
++        const directory = path.join(home, ".claude", "worktrees", "resume-test")
++        expect((yield* Effect.promise(() => Bun.file(path.join(directory, "resumed.txt")).text())).trim()).toBe(
++          yield* Effect.promise(async () => {
++            const fs = await import("node:fs/promises")
++            return fs.realpath(directory)
++          }),
++        )
++      }),
++    60_000,
++  )
++
++  cliIt.live(
++    "blocks shell writes into the protected checkout",
++    ({ home, llm, opencode }) =>
++      Effect.gen(function* () {
++        yield* Effect.promise(() => initialise(home))
++        const blocked = path.join(home, "blocked.txt")
++        yield* llm.push(
++          reply().tool("bash", {
++            command: `echo blocked > ${JSON.stringify(blocked)}`,
++            description: "Attempt to write outside the worktree",
++          }),
++        )
++        yield* llm.text("blocked")
++
++        const result = yield* opencode.spawn([
++          "run",
++          "--model",
++          testModelID,
++          "-w",
++          "isolation-test",
++          "--dangerously-skip-permissions",
++          "--prompt",
++          "try protected write",
++        ])
++
++        opencode.expectExit(result, 0)
++        expect(yield* Effect.promise(() => Bun.file(blocked).exists())).toBe(false)
++      }),
++    60_000,
++  )
++
++  cliIt.live(
++    "clears a missing worktree binding and resumes in the launch checkout",
++    ({ home, llm, opencode }) =>
++      Effect.gen(function* () {
++        yield* Effect.promise(() => initialise(home))
++        yield* llm.text("created")
++        const first = yield* opencode.spawn(
++          ["run", "--model", testModelID, "--format", "json", "-w", "gone-test", "--prompt", "start"],
++          { env: { OPENCODE_DB: "opencode.db" } },
++        )
++        opencode.expectExit(first, 0)
++        const sessionID = String(opencode.parseJsonEvents(first.stdout)[0]?.sessionID)
++        const directory = path.join(home, ".claude", "worktrees", "gone-test")
++        yield* Effect.promise(() => $`git worktree remove --force ${directory}`.cwd(home).quiet())
++
++        yield* llm.push(
++          reply().tool("bash", {
++            command: `pwd > ${JSON.stringify(path.join(home, "recovered.txt"))}`,
++            description: "Record recovery directory",
++          }),
++        )
++        yield* llm.text("recovered")
++        const resumed = yield* opencode.spawn(
++          ["run", "--model", testModelID, "--session", sessionID, "--dangerously-skip-permissions", "continue"],
++          { env: { OPENCODE_DB: "opencode.db" } },
++        )
++
++        opencode.expectExit(resumed, 0)
++        expect(resumed.stderr).toContain("is unavailable")
++        expect((yield* Effect.promise(() => Bun.file(path.join(home, "recovered.txt")).text())).trim()).toBe(
++          yield* Effect.promise(async () => {
++            const fs = await import("node:fs/promises")
++            return fs.realpath(home)
++          }),
++        )
++      }),
++    60_000,
++  )
++
++  cliIt.live(
++    "blocks obfuscated protected checkout paths",
++    ({ home, llm, opencode }) =>
++      Effect.gen(function* () {
++        yield* Effect.promise(() => initialise(home))
++        const blocked = path.join(home, "blocked.txt")
++        const obfuscated = blocked.replace(
++          path.basename(home),
++          `${path.basename(home).slice(0, -1)}""${path.basename(home).at(-1)}`,
++        )
++        yield* llm.push(
++          reply().tool("bash", {
++            command: `touch ${obfuscated}`,
++            description: "Attempt an obfuscated protected write",
++          }),
++        )
++        yield* llm.text("blocked")
++
++        const result = yield* opencode.spawn([
++          "run",
++          "--model",
++          testModelID,
++          "-w",
++          "obfuscated-isolation",
++          "--dangerously-skip-permissions",
++          "--prompt",
++          "try obfuscated write",
++        ])
++
++        opencode.expectExit(result, 0)
++        expect(yield* Effect.promise(() => Bun.file(blocked).exists())).toBe(false)
++      }),
++    60_000,
++  )
++
++  cliIt.live(
++    "fails before model execution when a create hook exits non-zero",
++    ({ home, opencode }) =>
++      Effect.gen(function* () {
++        yield* Effect.promise(() =>
++          Bun.write(
++            path.join(home, ".claude", "settings.local.json"),
++            JSON.stringify({
++              hooks: {
++                WorktreeCreate: [{ hooks: [{ type: "command", command: "echo setup-failed >&2; exit 7" }] }],
++              },
++            }),
++          ),
++        )
++
++        const result = yield* opencode.spawn([
++          "run",
++          "-w",
++          "hook-failure",
++          "--dangerously-skip-permissions",
++          "--prompt",
++          "must not run",
++        ])
++
++        expect(result.exitCode).not.toBe(0)
++        expect(result.stderr).toContain("setup-failed")
++      }),
++    30_000,
++  )
++
++  cliIt.live(
++    "rejects multiple create hooks before running either command",
++    ({ home, opencode }) =>
++      Effect.gen(function* () {
++        const first = path.join(home, "first-ran")
++        const second = path.join(home, "second-ran")
++        yield* Effect.promise(() =>
++          Bun.write(
++            path.join(home, ".claude", "settings.local.json"),
++            JSON.stringify({
++              hooks: {
++                WorktreeCreate: [
++                  [{ type: "command", command: `touch ${JSON.stringify(first)}` }],
++                  [{ type: "command", command: `touch ${JSON.stringify(second)}` }],
++                ].map((hooks) => ({ hooks })),
++              },
++            }),
++          ),
++        )
++
++        const result = yield* opencode.spawn([
++          "run",
++          "-w",
++          "multiple-hooks",
++          "--dangerously-skip-permissions",
++          "--prompt",
++          "must not run",
++        ])
++
++        expect(result.exitCode).not.toBe(0)
++        expect(result.stderr).toContain("Multiple WorktreeCreate")
++        expect(yield* Effect.promise(() => Bun.file(first).exists())).toBe(false)
++        expect(yield* Effect.promise(() => Bun.file(second).exists())).toBe(false)
++      }),
++    30_000,
++  )
++
++  cliIt.live(
++    "rejects a custom hook path inside the protected checkout",
++    ({ home, opencode }) =>
++      Effect.gen(function* () {
++        const source = path.join(home, "source")
++        yield* Effect.promise(async () => {
++          const fs = await import("node:fs/promises")
++          await fs.mkdir(source)
++          await Bun.write(
++            path.join(home, ".claude", "settings.local.json"),
++            JSON.stringify({
++              hooks: {
++                WorktreeCreate: [{ hooks: [{ type: "command", command: `echo ${JSON.stringify(source)}` }] }],
++              },
++            }),
++          )
++        })
++
++        const result = yield* opencode.spawn([
++          "run",
++          "-w",
++          "unsafe-hook",
++          "--dangerously-skip-permissions",
++          "--prompt",
++          "must not run",
++        ])
++
++        expect(result.exitCode).not.toBe(0)
++        expect(result.stderr).toContain("Custom worktree is not isolated")
++      }),
++    30_000,
++  )
++
++  cliIt.live(
++    "preserves the original cleanup base when reopening a worktree with commits",
++    ({ home, llm, opencode }) =>
++      Effect.gen(function* () {
++        yield* Effect.promise(() => initialise(home))
++        yield* llm.text("created")
++        const first = yield* opencode.spawn(["run", "--model", testModelID, "-w", "reuse-test", "--prompt", "create"])
++        opencode.expectExit(first, 0)
++        const directory = path.join(home, ".claude", "worktrees", "reuse-test")
++        const originalBase = (yield* Effect.promise(() => $`git rev-parse HEAD`.cwd(directory).quiet().text())).trim()
++        yield* Effect.promise(async () => {
++          await Bun.write(path.join(directory, "work.txt"), "retained\n")
++          await git(directory, "add", "work.txt")
++          await git(directory, "commit", "-m", "retained work")
++        })
++
++        yield* llm.text("reopened")
++        const second = yield* opencode.spawn(["run", "--model", testModelID, "-w", "reuse-test", "--prompt", "reopen"])
++        opencode.expectExit(second, 0)
++        const records = yield* Effect.promise(async () => {
++          const fs = await import("node:fs/promises")
++          const root = path.join(home, ".local", "share", "opencode", "worktree-session")
++          return Promise.all((await fs.readdir(root)).map((name) => Bun.file(path.join(root, name)).json()))
++        })
++        const latest = records.toSorted((left, right) => right.timeCreated - left.timeCreated)[0]
++        expect(latest.base).toBe(originalBase)
++        expect(latest.branch).toBe("worktree-reuse-test")
++      }),
++    60_000,
++  )
++})
+diff --git a/packages/opencode/test/tool/task.test.ts b/packages/opencode/test/tool/task.test.ts
+index 42f46fd35d..04c57442f4 100644
+--- a/packages/opencode/test/tool/task.test.ts
++++ b/packages/opencode/test/tool/task.test.ts
+@@ -471,6 +471,8 @@ describe("tool.task", () => {
+     Effect.gen(function* () {
+       const sessions = yield* Session.Service
+       const { chat, assistant } = yield* seed()
++      const binding = { directory: "/tmp/worktree", protectedDirectories: ["/tmp/project"] }
++      yield* sessions.setMetadata({ sessionID: chat.id, metadata: { "opencode.worktree": binding } })
+       const tool = yield* TaskTool
+       const def = yield* tool.init()
+       let seen: SessionPrompt.PromptInput | undefined
+@@ -498,6 +500,7 @@ describe("tool.task", () => {
+       const kids = yield* sessions.children(chat.id)
+       expect(kids).toHaveLength(1)
+       expect(kids[0]?.id).toBe(result.metadata.sessionId)
++      expect(kids[0]?.metadata?.["opencode.worktree"]).toEqual(binding)
+       expect(result.metadata.sessionId).not.toBe("ses_missing")
+       expect(result.output).toContain(`<task id="${result.metadata.sessionId}" state="completed">`)
+       expect(seen?.sessionID).toBe(result.metadata.sessionId)
+diff --git a/packages/opencode/test/tool/worktree-isolation.test.ts b/packages/opencode/test/tool/worktree-isolation.test.ts
+new file mode 100644
+index 0000000000..36915e8a7a
+--- /dev/null
++++ b/packages/opencode/test/tool/worktree-isolation.test.ts
+@@ -0,0 +1,71 @@
++import { describe, expect, test } from "bun:test"
++import { Effect } from "effect"
++import fs from "node:fs/promises"
++import path from "node:path"
++import { tmpdir } from "../fixture/fixture"
++import { assertPath } from "@/tool/worktree-isolation"
++import { MessageID, SessionID } from "@/session/schema"
++
++describe("worktree isolation", () => {
++  test("allows the active nested worktree and rejects its protected checkout", async () => {
++    await using tmp = await tmpdir()
++    const worktree = path.join(tmp.path, ".claude", "worktrees", "feature")
++    await fs.mkdir(worktree, { recursive: true })
++    const ctx = {
++      sessionID: SessionID.make("ses_worktree-isolation"),
++      messageID: MessageID.make("msg_worktree-isolation"),
++      agent: "build",
++      abort: AbortSignal.any([]),
++      messages: [],
++      metadata: () => Effect.void,
++      ask: () => Effect.void,
++      extra: {
++        worktree: {
++          directory: worktree,
++          protectedDirectories: [tmp.path],
++        },
++      },
++    }
++
++    await expect(Effect.runPromise(assertPath(ctx, path.join(worktree, "safe.txt")))).resolves.toBeUndefined()
++    await expect(Effect.runPromise(assertPath(ctx, path.join(tmp.path, "protected.txt")))).rejects.toThrow(
++      "Worktree isolation prevents access to the protected checkout",
++    )
++  })
++
++  test("rejects a symlink from the active worktree into the protected checkout", async () => {
++    if (process.platform === "win32") return
++    await using tmp = await tmpdir()
++    const worktree = path.join(tmp.path, ".claude", "worktrees", "feature")
++    const protectedDirectory = path.join(tmp.path, "source")
++    await fs.mkdir(worktree, { recursive: true })
++    await fs.mkdir(protectedDirectory)
++    await fs.symlink(protectedDirectory, path.join(worktree, "escape"))
++    await fs.symlink(path.join(protectedDirectory, "missing.txt"), path.join(worktree, "dangling"))
++    const ctx = {
++      sessionID: SessionID.make("ses_worktree-symlink"),
++      messageID: MessageID.make("msg_worktree-symlink"),
++      agent: "build",
++      abort: AbortSignal.any([]),
++      messages: [],
++      metadata: () => Effect.void,
++      ask: () => Effect.void,
++      extra: {
++        worktree: {
++          directory: worktree,
++          protectedDirectories: [tmp.path],
++        },
++      },
++    }
++
++    for (const target of [
++      path.join(worktree, "escape", "file.txt"),
++      path.join(worktree, "escape", "new-directory", "file.txt"),
++      path.join(worktree, "dangling"),
++    ]) {
++      await expect(Effect.runPromise(assertPath(ctx, target))).rejects.toThrow(
++        "Worktree isolation prevents access to the protected checkout",
++      )
++    }
++  })
++})
+diff --git a/packages/sdk/js/src/v2/gen/sdk.gen.ts b/packages/sdk/js/src/v2/gen/sdk.gen.ts
+index a2bcd4252c..01f4483284 100644
+--- a/packages/sdk/js/src/v2/gen/sdk.gen.ts
++++ b/packages/sdk/js/src/v2/gen/sdk.gen.ts
+@@ -3411,6 +3411,7 @@ export class Session2 extends HeyApiClient {
+     parameters?: {
+       directory?: string
+       workspace?: string
++      id?: string
+       parentID?: string
+       title?: string
+       agent?: string
+@@ -3434,6 +3435,7 @@ export class Session2 extends HeyApiClient {
+           args: [
+             { in: "query", key: "directory" },
+             { in: "query", key: "workspace" },
++            { in: "body", key: "id" },
+             { in: "body", key: "parentID" },
+             { in: "body", key: "title" },
+             { in: "body", key: "agent" },
+diff --git a/packages/sdk/js/src/v2/gen/types.gen.ts b/packages/sdk/js/src/v2/gen/types.gen.ts
+index f06c20cc41..a1f2bd854e 100644
+--- a/packages/sdk/js/src/v2/gen/types.gen.ts
++++ b/packages/sdk/js/src/v2/gen/types.gen.ts
+@@ -9475,6 +9475,7 @@ export type SessionListResponse = SessionListResponses[keyof SessionListResponse
+ 
+ export type SessionCreateData = {
+   body?: {
++    id?: string
+     parentID?: string
+     title?: string
+     agent?: string
+diff --git a/packages/tui/src/component/dialog-session-list.tsx b/packages/tui/src/component/dialog-session-list.tsx
+index c508fc6b7b..c61d96f3ab 100644
+--- a/packages/tui/src/component/dialog-session-list.tsx
++++ b/packages/tui/src/component/dialog-session-list.tsx
+@@ -280,7 +280,9 @@ export function DialogSessionList() {
+       onMove={() => {
+         setToDelete(undefined)
+       }}
+-      onSelect={(option) => {
++      onSelect={async (option) => {
++        const result = await sdk.client.session.get({ sessionID: option.value })
++        if (result.data?.directory) sdk.setDirectory(result.data.directory)
+         route.navigate({
+           type: "session",
+           sessionID: option.value,
+diff --git a/packages/tui/src/component/prompt/index.tsx b/packages/tui/src/component/prompt/index.tsx
+index c48c751739..fa1e48dc57 100644
+--- a/packages/tui/src/component/prompt/index.tsx
++++ b/packages/tui/src/component/prompt/index.tsx
+@@ -997,7 +997,11 @@ export function Prompt(props: PromptProps) {
+       if (move.pending() && !directory) return false
+       finishMoveProgress = Boolean(move.progress())
+ 
++      const reserved = args.session
+       const res = await sdk.client.session.create({
++        id: reserved?.id,
++        title: reserved?.title ?? args.name,
++        metadata: reserved?.metadata,
+         directory,
+         workspace: workspaceID,
+         agent: agent.name,
+@@ -1020,6 +1024,7 @@ export function Prompt(props: PromptProps) {
+         return true
+       }
+ 
++      args.session = undefined
+       sessionID = res.data.id
+     }
+ 
+diff --git a/packages/tui/src/context/args.tsx b/packages/tui/src/context/args.tsx
+index 9a528f2f0e..5e3ddf7f03 100644
+--- a/packages/tui/src/context/args.tsx
++++ b/packages/tui/src/context/args.tsx
+@@ -8,6 +8,12 @@ export interface Args {
+   sessionID?: string
+   fork?: boolean
+   auto?: boolean
++  name?: string
++  session?: {
++    id: string
++    title?: string
++    metadata: Record<string, unknown>
++  }
+ }
+ 
+ export const { use: useArgs, provider: ArgsProvider } = createSimpleContext({
+diff --git a/packages/tui/src/context/sdk.tsx b/packages/tui/src/context/sdk.tsx
+index 93180c6e21..34d5aaa02b 100644
+--- a/packages/tui/src/context/sdk.tsx
++++ b/packages/tui/src/context/sdk.tsx
+@@ -142,7 +142,15 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+       get client() {
+         return sdk
+       },
+-      directory: props.directory,
++      get directory() {
++        return props.directory
++      },
++      setDirectory(directory: string) {
++        if (props.directory === directory) return
++        props.directory = directory
++        sdk = createSDK()
++        if (!props.events) startSSE()
++      },
+       event: emitter,
+       fetch: props.fetch ?? fetch,
+       url: props.url,
